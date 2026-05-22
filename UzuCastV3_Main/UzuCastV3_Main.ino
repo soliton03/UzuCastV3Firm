@@ -2,7 +2,6 @@
 #include "SD_MMC.h"
 
 #include <WiFi.h>
-#include <WebServer.h>
 #include <DNSServer.h>
 #include <WebSocketsServer.h>
 
@@ -46,13 +45,13 @@ static bool tdm_set_sample_rate(uint32_t sampleRate);
 static bool tdm_enable_output();
 static void tdm_disable_output();
 
-static void handleRoot();
-static void handleNotFound();
 static void wsSendTracks(uint8_t clientId);
 static void wsSendState(uint8_t clientId);
 static void wsBroadcastState();
 static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
 static void json_append_escaped(String& s, const char* p);
+static void performSystemInit(bool verbose);
+static void shutdownNetworkServices();
 
 // ====================================================
 // Power control pins
@@ -79,17 +78,16 @@ static bool g_mounted = false;
 // ====================================================
 // WiFi AP / DNS
 // ====================================================
-static const char* AP_SSID = "UZU-CAST-HOST";
-static const bool  AP_OPEN = true;
+static const char* AP_SSID     = "UZU-CAST-HOST";
+static const char* AP_PASSWORD = "12345678";
+static const bool  AP_OPEN     = true;
 
-static const IPAddress AP_IP  (192, 168, 1, 1);
-static const IPAddress AP_GW  (192, 168, 1, 1);
+static const IPAddress AP_IP  (192, 168, 4, 1);
+static const IPAddress AP_GW  (192, 168, 4, 1);
 static const IPAddress AP_MASK(255, 255, 255, 0);
 static const byte DNS_PORT = 53;
 
-static WebServer        server(80);
-static DNSServer        dns;
-static WebSocketsServer ws(81);
+static DNSServer dns;
 
 // ====================================================
 // TDM pins / format
@@ -441,7 +439,8 @@ static const char kHtml[] PROGMEM = R"HTML(
   }
 
   function connectWS(){
-    const url = "ws://192.168.1.1:81/";
+    const host = window.location.hostname || "192.168.4.1";
+    const url = "ws://" + host + "/";
     wsState.textContent = "WS: CONNECTING";
 
     ws = new WebSocket(url);
@@ -581,6 +580,63 @@ static const char kHtml[] PROGMEM = R"HTML(
 </body>
 </html>
 )HTML";
+
+static void sendHttpHtmlPage(WSclient_t* client, PGM_P html) {
+  size_t len = strlen_P(html);
+  client->tcp->printf(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Connection: close\r\n"
+    "Content-Length: %u\r\n"
+    "\r\n",
+    (unsigned)len);
+
+  const size_t chunk = 1024;
+  for (size_t off = 0; off < len; off += chunk) {
+    size_t n = (len - off > chunk) ? (chunk) : (len - off);
+    char buf[1024];
+    memcpy_P(buf, html + off, n);
+    client->tcp->write((uint8_t*)buf, n);
+  }
+}
+
+static void sendHttpRedirect(WSclient_t* client, const char* location) {
+  client->tcp->printf(
+    "HTTP/1.1 302 Found\r\n"
+    "Location: %s\r\n"
+    "Content-Type: text/plain\r\n"
+    "Connection: close\r\n"
+    "Content-Length: 12\r\n"
+    "\r\n"
+    "Redirecting",
+    location);
+}
+
+class UzuWebSocketsServer : public WebSocketsServer {
+public:
+  UzuWebSocketsServer(uint16_t port) : WebSocketsServer(port) {}
+
+protected:
+  void handleNonWebsocketConnection(WSclient_t* client) override {
+    String path = client->cUrl;
+    int q = path.indexOf('?');
+    if (q >= 0) path = path.substring(0, q);
+    if (path.length() == 0) path = "/";
+
+    if (path == "/" || path == "/index.html") {
+      sendHttpHtmlPage(client, kHtml);
+      clientDisconnect(client);
+      return;
+    }
+
+    char loc[64];
+    snprintf(loc, sizeof(loc), "http://%s/", AP_IP.toString().c_str());
+    sendHttpRedirect(client, loc);
+    clientDisconnect(client);
+  }
+};
+
+static UzuWebSocketsServer ws(80);
 
 // ====================================================
 // Utility implementations
@@ -1193,15 +1249,6 @@ static void json_append_escaped(String& s, const char* p) {
   }
 }
 
-static void handleRoot() {
-  server.send(200, "text/html; charset=utf-8", kHtml);
-}
-
-static void handleNotFound() {
-  server.sendHeader("Location", String("http://") + AP_IP.toString() + "/", true);
-  server.send(302, "text/plain", "Redirecting...");
-}
-
 static bool read_uzu_track_info(const char* path, WebTrackInfo& info) {
   memset(&info, 0, sizeof(info));
   if (!path || !path[0] || !g_mounted) return false;
@@ -1655,11 +1702,22 @@ private:
       cmdStat(); return;
     }
 
+    if (strcmp(argv[0], "RESET") == 0) {
+      if (argc != 1) { println("ERR BAD_PARAM"); return; }
+      cmdReset(); return;
+    }
+
     println("ERR UNKNOWN_CMD");
   }
 
   void cmdHelp() {
     println("OK HELP");
+    m_serial->print("  AP SSID       : ");
+    m_serial->println(AP_SSID);
+    m_serial->print("  AP PASSWORD   : ");
+    m_serial->println(AP_OPEN ? "(open)" : AP_PASSWORD);
+    m_serial->print("  AP IP         : ");
+    m_serial->println(WiFi.softAPIP());
     println("  HELP / ?      : show help");
     println("  CHECKDISK     : show SD card status");
     println("  MOUNT         : mount SD card");
@@ -1673,6 +1731,13 @@ private:
     println("  SEEK <ms>     : seek position in ms");
     println("  VOL <0-127>   : set output volume");
     println("  STAT          : show current status");
+    println("  RESET         : reinitialize from setup");
+  }
+
+  void cmdReset() {
+    shutdownNetworkServices();
+    performSystemInit(false);
+    println("OK RESET");
   }
 
   void cmdCheckDisk() {
@@ -1997,6 +2062,59 @@ private:
 
 static CommandParser g_parser;
 
+static void performSystemInit(bool verbose) {
+  pinMode(PIN_SD_CD, INPUT);
+
+  g_player.stop();
+  clearFileList();
+  g_selectedTrack0 = 0;
+  g_selectedLenMs = 0;
+
+  g_mounted = mount_sdmmc_4bit(g_sd_freq_hz);
+  if (verbose) {
+    Serial.println(g_mounted ? "Auto mount OK" : "Auto mount FAILED");
+  }
+
+  if (!g_player.begin()) {
+    if (verbose) Serial.println("TDM init FAILED");
+  }
+
+  if (g_mounted) {
+    scanUzuFiles("/");
+  }
+
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
+
+  bool ok;
+  if (AP_OPEN) ok = WiFi.softAP(AP_SSID);
+  else         ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  if (verbose) {
+    Serial.println(ok ? "SoftAP started." : "SoftAP start FAILED.");
+    Serial.print("AP SSID: "); Serial.println(AP_SSID);
+    Serial.print("AP IP  : "); Serial.println(WiFi.softAPIP());
+  }
+
+  dns.start(DNS_PORT, "*", AP_IP);
+
+  ws.begin();
+  ws.onEvent(onWsEvent);
+  ws.enableHeartbeat(15000, 3000, 2);
+  if (verbose) {
+    Serial.println("HTTP + WebSocket server started on port 80.");
+  }
+}
+
+static void shutdownNetworkServices() {
+  ws.disconnect();
+  ws.close();
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
 // ====================================================
 // setup / loop
 // ====================================================
@@ -2008,43 +2126,11 @@ void setup() {
   g_power.begin();
   g_power.waitUntilPowerOn();
 
-  pinMode(PIN_SD_CD, INPUT);
-
   Serial.println();
   Serial.println("UZU Player + TDM + WiFi Control + Power");
   Serial.println("Type HELP or ?");
 
-  g_mounted = mount_sdmmc_4bit(g_sd_freq_hz);
-  Serial.println(g_mounted ? "Auto mount OK" : "Auto mount FAILED");
-
-  if (!g_player.begin()) {
-    Serial.println("TDM init FAILED");
-  }
-
-  if (g_mounted) {
-    scanUzuFiles("/");
-  }
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-
-  bool ok;
-  if (AP_OPEN) ok = WiFi.softAP(AP_SSID);
-  else         ok = WiFi.softAP(AP_SSID, "12345678");
-
-  Serial.println(ok ? "SoftAP started." : "SoftAP start FAILED.");
-  Serial.print("AP SSID: "); Serial.println(AP_SSID);
-  Serial.print("AP IP  : "); Serial.println(WiFi.softAPIP());
-
-  dns.start(DNS_PORT, "*", AP_IP);
-
-  server.on("/", handleRoot);
-  server.onNotFound(handleNotFound);
-  server.begin();
-
-  ws.begin();
-  ws.onEvent(onWsEvent);
-  ws.enableHeartbeat(15000, 3000, 2);
+  performSystemInit(true);
 
   g_parser.begin(Serial);
 }
@@ -2064,6 +2150,5 @@ void loop() {
   g_player.process();
 
   dns.processNextRequest();
-  server.handleClient();
   ws.loop();
 }
