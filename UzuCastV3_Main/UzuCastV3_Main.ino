@@ -1,3 +1,14 @@
+/*
+Board:            ESP32S3 Dev Module
+Flash Size:       16MB (128Mb)
+PSRAM:            QSPI PSRAM
+Partition Scheme: 16M Flash (3MB APP/9.9MB FATFS)
+CPU Frequency:    240MHz (WiFi)
+Flash Mode:       QIO 80MHz
+Upload Speed:     921600
+Core Debug Level: None
+USB CDC On Boot:  用途に応じて（USB シリアルなら Enabled）
+*/
 #include <Arduino.h>
 #include "SD_MMC.h"
 
@@ -7,12 +18,16 @@
 
 #include "driver/i2s_tdm.h"
 #include <esp_arduino_version.h>
+#include <esp_heap_caps.h>
 
 #if ESP_ARDUINO_VERSION_MAJOR != 3
   #error "This project requires ESP32 Arduino Core 3.x (IDF5)."
 #endif
 
-#define VERSION_STRING  "UZU CAST Version 1.00"
+#define VERSION_STRING   "UZU CAST Version 1.00"
+#define FIRMWARE_BUILD   10025
+#define FIRMWARE_BUILD_STR_HELPER(x) #x
+#define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 // ====================================================
 // Forward declarations
 // ====================================================
@@ -32,6 +47,14 @@ static bool read_uzu_length_ms(const char* path, uint32_t& lengthMs);
 struct WebTrackInfo;
 static bool read_uzu_track_info(const char* path, WebTrackInfo& info);
 static void wsSendTrackInfo(uint8_t clientId, int trackIndex0);
+static void wsBroadcastStreamStatus();
+static void wsBroadcastBufferInfo();
+static void wsBroadcastUnderrun();
+static void wsRequestStreamStatus();
+static void wsRequestBufferInfo();
+static void wsRequestUnderrun();
+static void wsProcessNotifications();
+static bool handleStreamTextCommand(uint8_t num, const String& msg);
 
 static const char* getCardTypeString();
 static bool mount_sdmmc_4bit(uint32_t freq_hz);
@@ -325,6 +348,7 @@ static const char kHtml[] PROGMEM = R"HTML(
 </head>
 <body>
   <h1>UZU CAST HOST</h1>
+  <div class="mono" id="fwBuild">Firmware Build: )HTML" FIRMWARE_BUILD_STR(FIRMWARE_BUILD) R"HTML(</div>
 
   <div class="card">
     <div class="row">
@@ -368,6 +392,24 @@ static const char kHtml[] PROGMEM = R"HTML(
     <div class="mono" id="volLabel">VOL=127</div>
   </div>
 
+  <div class="card">
+    <h2>5) ストリームテスト</h2>
+    <div class="row">
+      <button id="btnTestTone">テスト音 440Hz</button>
+      <label for="testChSelect">CH:</label>
+      <select id="testChSelect">
+        <option value="2">2ch</option>
+        <option value="5" selected>5ch</option>
+        <option value="8">8ch</option>
+      </select>
+    </div>
+    <div class="mono" id="testToneState">Test: OFF</div>
+    <div class="mono" id="testToneRate">Rate: -</div>
+    <div class="mono" id="bufferMonitor">Buffer: - / - (0% used)</div>
+    <div class="mono" id="underrunMonitor">Underrun: 0</div>
+    <div class="mono" id="dropMonitor">Dropped: 0 bytes</div>
+  </div>
+
 <script>
 (function(){
   const $ = (id)=>document.getElementById(id);
@@ -382,12 +424,126 @@ static const char kHtml[] PROGMEM = R"HTML(
   const seekLabel = $("seekLabel");
   const vol = $("vol");
   const volLabel = $("volLabel");
+  const btnTestTone = $("btnTestTone");
+  const testChSelect = $("testChSelect");
+  const testToneState = $("testToneState");
+  const testToneRate = $("testToneRate");
+  const bufferMonitor = $("bufferMonitor");
+  const underrunMonitor = $("underrunMonitor");
+  const dropMonitor = $("dropMonitor");
 
   let ws;
   let currentTrackIndex = 0;
   let currentLenMs = 0;
   let currentPlayState = "STOP";
   let detailVisible = false;
+  let testToneActive = false;
+  let testToneFreeBytes = 1048576;
+  let testToneUsedBytes = 0;
+  let testToneBufferSize = 1048576;
+  let testToneUnderrunCount = 0;
+  let testToneDroppedBytes = 0;
+  let testToneLastDroppedBytes = 0;
+  let testToneChunksSent = 0;
+  let testToneBackoffUntil = 0;
+  const TEST_CHANNEL_MODES = [2, 5, 8];
+  let testToneChannels = 5;
+  let testTonePhases = [0, 0, 0, 0, 0, 0, 0, 0];
+  let testToneSendTimer = null;
+  let testToneStartPending = false;
+  let testToneFillPct = 0;
+  let testToneResumeAfterReconnect = false;
+  let testPrefillTarget = 131072;
+  let testLowWater = 98304;
+  let testHighWater = 216268;
+  const TEST_SAMPLE_RATE = 44100;
+  const TEST_AMPLITUDE = 6000;
+  const TEST_SEND_MARGIN = 8192;
+  const SIN_TABLE_SIZE = 1024;
+  const SIN_TABLE = new Float32Array(SIN_TABLE_SIZE);
+  for(let i = 0; i < SIN_TABLE_SIZE; i++){
+    SIN_TABLE[i] = Math.sin(2 * Math.PI * i / SIN_TABLE_SIZE);
+  }
+
+  function fastSin01(phase){
+    let idx = (phase * SIN_TABLE_SIZE) | 0;
+    if(idx >= SIN_TABLE_SIZE) idx -= SIN_TABLE_SIZE;
+    return SIN_TABLE[idx];
+  }
+
+  function testFramesPerChunk(){
+    return 256;
+  }
+
+  function testChunkBytes(){
+    return testFramesPerChunk() * testToneChannels * 2;
+  }
+
+  function testDataRate(){
+    return TEST_SAMPLE_RATE * testToneChannels * 2;
+  }
+
+  function testBandTier(){
+    if(testToneChannels >= 8) return 2;
+    if(testToneChannels >= 5) return 1;
+    return 0;
+  }
+
+  function testPumpIntervalMs(){
+    const tier = testBandTier();
+    if(tier >= 2) return 5;
+    if(tier >= 1) return 8;
+    return 10;
+  }
+
+  function testWsBufferMax(){
+    const tier = testBandTier();
+    if(tier >= 2) return 65536;
+    if(tier >= 1) return 49152;
+    return 32768;
+  }
+
+  function setTestToneChannels(ch){
+    const n = parseInt(ch, 10);
+    testToneChannels = TEST_CHANNEL_MODES.includes(n) ? n : 5;
+  }
+
+  function updateTestChModeUi(){
+    testChSelect.value = String(testToneChannels);
+    testChSelect.disabled = testToneActive;
+    updateTestRateLabel();
+  }
+
+  function updateTestRateLabel(){
+    const kbps = Math.round((testDataRate() * 8) / 1000);
+    testToneRate.textContent =
+      "Rate: " + testDataRate() + " B/s (" + kbps + " kbps), chunk " + testChunkBytes() + " B";
+  }
+
+  function updateTestWatermarks(){
+    const cap = testToneBufferSize > 0 ? testToneBufferSize : 1048576;
+    const chunk = testChunkBytes();
+    testPrefillTarget = Math.max(chunk * 8, Math.floor(cap / 3));
+    testLowWater = Math.max(chunk * 8, Math.floor(cap * 0.30));
+    testHighWater = Math.floor(cap * 0.50);
+  }
+
+  function maxPumpChunks(){
+    if(testToneFillPct >= 70) return 1;
+    if(testToneChannels >= 8){
+      if(testToneStartPending) return 6;
+      if(testToneUsedBytes < testLowWater) return 4;
+      return 3;
+    }
+    if(testToneChannels >= 5){
+      if(testToneStartPending) return 6;
+      if(testToneUsedBytes < testLowWater) return 4;
+      return 3;
+    }
+    if(testToneStartPending) return 6;
+    if(testToneUsedBytes < testLowWater) return 4;
+    return 2;
+  }
 
   function mmss(ms){
     ms = Math.max(0, ms|0);
@@ -430,6 +586,8 @@ static const char kHtml[] PROGMEM = R"HTML(
   updateSeekLabel();
   updateVolLabel();
   updateTrackLock();
+  updateBufferMonitor();
+  updateTestChModeUi();
 
   function send(obj){
     const s = JSON.stringify(obj);
@@ -438,21 +596,183 @@ static const char kHtml[] PROGMEM = R"HTML(
     }
   }
 
+  function updateBufferMonitor(){
+    const used = testToneUsedBytes|0;
+    const total = testToneBufferSize|0;
+    const free = testToneFreeBytes|0;
+    const pct = total > 0 ? Math.round((used * 100) / total) : 0;
+    bufferMonitor.textContent =
+      "Buffer: used " + used + " / " + total + " (" + pct + "%), free " + free +
+      ", CH=" + testToneChannels + ", sent " + (testToneChunksSent|0);
+    underrunMonitor.textContent = "Underrun: " + (testToneUnderrunCount|0);
+    dropMonitor.textContent = "Dropped: " + (testToneDroppedBytes|0) + " bytes";
+  }
+
+  function buildTestPcmChunk(){
+    const chCount = testToneChannels;
+    const buf = new ArrayBuffer(testChunkBytes());
+    const view = new DataView(buf);
+    const step = 440 / TEST_SAMPLE_RATE;
+    let off = 0;
+    let phase = testTonePhases[0];
+    const frames = testFramesPerChunk();
+    for(let f = 0; f < frames; f++){
+      const sample = Math.round(TEST_AMPLITUDE * fastSin01(phase));
+      phase += step;
+      if(phase >= 1) phase -= 1;
+      for(let ch = 0; ch < chCount; ch++){
+        view.setInt16(off, sample, true);
+        off += 2;
+      }
+    }
+    testTonePhases[0] = phase;
+    return buf;
+  }
+
+  function canSendTestPcm(){
+    if(!testToneActive || !ws || ws.readyState !== WebSocket.OPEN) return false;
+    if(Date.now() < testToneBackoffUntil) return false;
+    if(ws.bufferedAmount > testWsBufferMax()) return false;
+    const chunk = testChunkBytes();
+    if(testToneFreeBytes < (chunk + TEST_SEND_MARGIN)) return false;
+    return true;
+  }
+
+  function sendTestChunks(maxCount){
+    let sent = 0;
+    const chunk = testChunkBytes();
+    while(sent < maxCount){
+      if(!canSendTestPcm()) break;
+      ws.send(buildTestPcmChunk());
+      testToneFreeBytes -= chunk;
+      testToneUsedBytes += chunk;
+      testToneChunksSent++;
+      sent++;
+    }
+    return sent;
+  }
+
+  function pumpTestPcm(){
+    if(!testToneActive) return;
+    if(ws.bufferedAmount > testWsBufferMax()) return;
+    sendTestChunks(maxPumpChunks());
+    maybeStartTestPlayback();
+  }
+
+  function maybeStartTestPlayback(){
+    if(!testToneStartPending) return;
+    if(testToneUsedBytes < testPrefillTarget) return;
+    testToneStartPending = false;
+    send({cmd:"start"});
+    testToneState.textContent = "Test: ON (" + testToneChannels + "ch 440Hz) / PLAYING";
+  }
+
+  function onTestToneBufferInfo(msg){
+    if(typeof msg.bufferSize === "number") testToneBufferSize = msg.bufferSize;
+    updateTestWatermarks();
+    if(typeof msg.freeBytes === "number") testToneFreeBytes = msg.freeBytes;
+    if(typeof msg.usedBytes === "number") testToneUsedBytes = msg.usedBytes;
+    if(typeof msg.fillPct === "number") testToneFillPct = msg.fillPct;
+    if(typeof msg.underrunCount === "number"){
+      if(msg.underrunCount > testToneUnderrunCount){
+        testToneBackoffUntil = 0;
+      }
+      testToneUnderrunCount = msg.underrunCount;
+    }
+    if(typeof msg.droppedBytes === "number"){
+      if(msg.droppedBytes > testToneLastDroppedBytes){
+        testToneBackoffUntil = Date.now() + 200;
+      }
+      testToneLastDroppedBytes = msg.droppedBytes;
+      testToneDroppedBytes = msg.droppedBytes;
+    }
+    if(msg.sendHold === true){
+      testToneBackoffUntil = Date.now() + 50;
+    }
+    updateBufferMonitor();
+    maybeStartTestPlayback();
+  }
+
+  function restartTestToneSendTimer(){
+    stopTestToneSendTimer();
+    startTestToneSendTimer();
+  }
+
+  function startTestToneSendTimer(){
+    if(testToneSendTimer) return;
+    testToneSendTimer = setInterval(pumpTestPcm, testPumpIntervalMs());
+  }
+
+  function stopTestToneSendTimer(){
+    if(!testToneSendTimer) return;
+    clearInterval(testToneSendTimer);
+    testToneSendTimer = null;
+  }
+
+  function startTestTone(){
+    send({cmd:"set_mode", mode:"STREAM"});
+    send({cmd:"file_info", name:"test.wav", sampleRate:TEST_SAMPLE_RATE, bitsPerSample:16, channels:testToneChannels});
+    send({cmd:"prepare"});
+    testToneActive = true;
+    testToneStartPending = true;
+    testTonePhases.fill(0);
+    testToneUnderrunCount = 0;
+    testToneDroppedBytes = 0;
+    testToneLastDroppedBytes = 0;
+    testToneBackoffUntil = 0;
+    testToneChunksSent = 0;
+    updateTestWatermarks();
+    updateTestChModeUi();
+    btnTestTone.textContent = "テスト音 停止";
+    testToneState.textContent = "Test: ON (" + testToneChannels + "ch 440Hz) / BUFFERING";
+    updateBufferMonitor();
+
+    restartTestToneSendTimer();
+  }
+
+  function stopTestToneLocal(){
+    testToneActive = false;
+    testToneStartPending = false;
+    stopTestToneSendTimer();
+    testToneBackoffUntil = 0;
+    btnTestTone.textContent = "テスト音 440Hz";
+    testToneState.textContent = "Test: OFF";
+    testToneFreeBytes = testToneBufferSize;
+    testToneUsedBytes = 0;
+    updateTestChModeUi();
+    updateBufferMonitor();
+  }
+
+  function stopTestTone(){
+    stopTestToneLocal();
+    testToneResumeAfterReconnect = false;
+    send({cmd:"stop"});
+    send({cmd:"reset_buffer"});
+    send({cmd:"set_mode", mode:"SD"});
+  }
+
   function connectWS(){
     const host = window.location.hostname || "192.168.4.1";
     const url = "ws://" + host + "/";
     wsState.textContent = "WS: CONNECTING";
 
     ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
 
     ws.onopen = ()=>{
       wsState.textContent = "WS: CONNECTED";
       send({cmd:"hello", client:"web"});
       send({cmd:"get_tracks"});
       send({cmd:"get_state"});
+      if(testToneResumeAfterReconnect){
+        testToneResumeAfterReconnect = false;
+        setTimeout(startTestTone, 300);
+      }
     };
 
     ws.onclose = (ev)=>{
+      testToneResumeAfterReconnect = testToneActive;
+      stopTestToneLocal();
       wsState.textContent = "WS: CLOSED code=" + ev.code;
       setTimeout(connectWS, 1000);
     };
@@ -462,8 +782,31 @@ static const char kHtml[] PROGMEM = R"HTML(
     };
 
     ws.onmessage = (ev)=>{
+      if(typeof ev.data !== "string"){
+        return;
+      }
       try{
         const msg = JSON.parse(ev.data);
+
+        if(msg.cmd === "buffer_info"){
+          onTestToneBufferInfo(msg);
+          return;
+        }
+
+        if(msg.cmd === "status"){
+          if(typeof msg.state === "string"){
+            testToneState.textContent = testToneActive
+              ? ("Test: ON (" + testToneChannels + "ch 440Hz) / " + msg.state)
+              : ("Test: OFF / " + msg.state);
+          }
+          return;
+        }
+
+        if(msg.cmd === "underrun"){
+          testToneUnderrunCount++;
+          updateBufferMonitor();
+          return;
+        }
 
         if(msg.type === "tracks" && Array.isArray(msg.items)){
           trackSelect.innerHTML = "";
@@ -564,13 +907,31 @@ static const char kHtml[] PROGMEM = R"HTML(
     send({cmd:"seek", posMs});
   };
 
-  vol.oninput = ()=> updateVolLabel();
-  vol.onchange = ()=>{
-    const value = parseInt(vol.value,10) || 0;
-    send({cmd:"vol", value});
+  vol.oninput = ()=>{
+    updateVolLabel();
+    send({cmd:"vol", value: parseInt(vol.value,10) || 0});
   };
 
+  btnTestTone.onclick = ()=>{
+    if(testToneActive) stopTestTone();
+    else startTestTone();
+  };
+
+  testChSelect.onchange = ()=>{
+    if(testToneActive){
+      testChSelect.value = String(testToneChannels);
+      return;
+    }
+    setTestToneChannels(testChSelect.value);
+    updateTestChModeUi();
+    updateTestWatermarks();
+  };
+
+  updateTestChModeUi();
+  updateTestWatermarks();
+
   setInterval(()=>{
+    if(testToneActive) return;
     if(ws && ws.readyState === WebSocket.OPEN){
       send({cmd:"get_state"});
     }
@@ -586,6 +947,7 @@ static void sendHttpHtmlPage(WSclient_t* client, PGM_P html) {
   client->tcp->printf(
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/html; charset=utf-8\r\n"
+    "Cache-Control: no-cache, no-store, must-revalidate\r\n"
     "Connection: close\r\n"
     "Content-Length: %u\r\n"
     "\r\n",
@@ -998,6 +1360,446 @@ static void tdm_disable_output() {
 }
 
 // ====================================================
+// Stream mode (V3)
+// ====================================================
+enum class DeviceMode {
+  SD = 0,
+  STREAM
+};
+
+enum class StreamState {
+  IDLE = 0,
+  PREPARED,
+  BUFFERING,
+  PLAYING,
+  PAUSED,
+  STOPPED,
+  ERROR
+};
+
+static DeviceMode g_deviceMode = DeviceMode::SD;
+
+class PcmRingBuffer {
+public:
+  static constexpr size_t PSRAM_TARGET_BYTES = 1048576;
+  static constexpr size_t PSRAM_FALLBACK_BYTES = 393216;
+  static constexpr size_t INTERNAL_FALLBACK_BYTES = 49152;
+
+  bool init() {
+    if (m_buf) return true;
+
+    m_capacity = PSRAM_TARGET_BYTES;
+    m_buf = (uint8_t*)heap_caps_malloc(m_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (m_buf) {
+      Serial.printf("[STREAM] ring %u bytes (PSRAM)\n", (unsigned)m_capacity);
+      reset();
+      return true;
+    }
+
+    m_capacity = PSRAM_FALLBACK_BYTES;
+    m_buf = (uint8_t*)heap_caps_malloc(m_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (m_buf) {
+      Serial.printf("[STREAM] ring %u bytes (PSRAM fallback)\n", (unsigned)m_capacity);
+      reset();
+      return true;
+    }
+
+    m_capacity = INTERNAL_FALLBACK_BYTES;
+    m_buf = (uint8_t*)heap_caps_malloc(m_capacity, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (m_buf) {
+      Serial.printf("[STREAM] ring %u bytes (internal fallback)\n", (unsigned)m_capacity);
+      reset();
+      return true;
+    }
+
+    Serial.println("[STREAM] ring buffer alloc FAILED");
+    m_capacity = 0;
+    return false;
+  }
+
+  size_t capacity() const { return m_capacity; }
+
+  void reset() {
+    m_head = 0;
+    m_tail = 0;
+  }
+
+  size_t usedBytes() const {
+    if (!m_buf || m_capacity <= 1) return 0;
+    if (m_head >= m_tail) return m_head - m_tail;
+    return m_capacity - m_tail + m_head;
+  }
+
+  size_t freeBytes() const {
+    if (!m_buf || m_capacity <= 1) return 0;
+    return m_capacity - usedBytes() - 1;
+  }
+
+  size_t write(const uint8_t* data, size_t len) {
+    if (!m_buf) return 0;
+    if (len > freeBytes()) return 0;
+
+    for (size_t i = 0; i < len; ++i) {
+      m_buf[m_head] = data[i];
+      m_head = (m_head + 1) % m_capacity;
+    }
+    return len;
+  }
+
+  size_t read(uint8_t* out, size_t len) {
+    if (!m_buf) return 0;
+    size_t avail = usedBytes();
+    size_t n = (len < avail) ? len : avail;
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = m_buf[m_tail];
+      m_tail = (m_tail + 1) % m_capacity;
+    }
+    return n;
+  }
+
+private:
+  uint8_t* m_buf = nullptr;
+  size_t m_capacity = 0;
+  size_t m_head = 0;
+  size_t m_tail = 0;
+};
+
+static PcmRingBuffer g_streamRing;
+static uint8_t g_streamPcmBuf[FRAMES_PER_WRITE * TDM_NUM_CH * 2];
+static uint32_t g_streamPendingSampleRate = TDM_DEFAULT_SAMPLE_RATE;
+static uint32_t g_streamPendingChannels = 2;
+static uint32_t g_streamPendingBits = 16;
+static uint32_t g_streamDroppedBytes = 0;
+static uint32_t g_streamRxBytes = 0;
+static uint32_t g_lastDropLogMs = 0;
+
+static uint32_t streamMinStartBytes() {
+  const size_t cap = g_streamRing.capacity();
+  if (cap == 0) return 16384;
+  return (uint32_t)(cap / 3);
+}
+
+class StreamEngine {
+public:
+  StreamState state() const { return m_state; }
+  uint32_t channelCount() const { return m_channels; }
+  uint32_t underrunCount() const { return m_underrunCount; }
+  uint32_t droppedBytes() const { return g_streamDroppedBytes; }
+  uint32_t rxBytes() const { return g_streamRxBytes; }
+
+  void reset() {
+    stopInternal(false);
+    m_state = StreamState::IDLE;
+    m_underrunCount = 0;
+  }
+
+  bool prepare(uint32_t sampleRate, uint32_t channels, uint32_t bits) {
+    if (bits != 16 || channels == 0 || channels > TDM_NUM_CH) {
+      m_state = StreamState::ERROR;
+      return false;
+    }
+    if (sampleRate != TDM_DEFAULT_SAMPLE_RATE && sampleRate != TDM_ALT_SAMPLE_RATE) {
+      m_state = StreamState::ERROR;
+      return false;
+    }
+
+    if (!g_streamRing.init()) {
+      m_state = StreamState::ERROR;
+      return false;
+    }
+
+    g_streamRing.reset();
+    g_streamDroppedBytes = 0;
+    g_streamRxBytes = 0;
+    m_sampleRate = sampleRate;
+    m_channels = channels;
+    m_bits = bits;
+    m_underrunSent = false;
+    m_underrunCount = 0;
+
+    if (!tdm_set_sample_rate(sampleRate)) {
+      m_state = StreamState::ERROR;
+      return false;
+    }
+
+    m_state = StreamState::PREPARED;
+    m_playRequested = false;
+    return true;
+  }
+
+  bool start() {
+    if (m_state != StreamState::PREPARED &&
+        m_state != StreamState::BUFFERING &&
+        m_state != StreamState::PAUSED) {
+      return false;
+    }
+    m_playRequested = true;
+    if (m_state == StreamState::PAUSED) {
+      if (!tdm_enable_output()) {
+        m_state = StreamState::ERROR;
+        return false;
+      }
+      m_state = StreamState::PLAYING;
+      m_underrunSent = false;
+      m_streamNextBlockUs = micros();
+      return true;
+    }
+    m_state = StreamState::BUFFERING;
+    m_underrunSent = false;
+    return true;
+  }
+
+  void stop() {
+    stopInternal(true);
+  }
+
+  void pause() {
+    if (m_state != StreamState::PLAYING) return;
+    tdm_disable_output();
+    m_state = StreamState::PAUSED;
+  }
+
+  void resume() {
+    if (m_state != StreamState::PAUSED) return;
+    if (!tdm_enable_output()) {
+      m_state = StreamState::ERROR;
+      return;
+    }
+    m_state = StreamState::PLAYING;
+    m_underrunSent = false;
+    m_streamNextBlockUs = micros();
+  }
+
+  void resetBuffer() {
+    g_streamRing.reset();
+    g_streamDroppedBytes = 0;
+    g_streamRxBytes = 0;
+    m_underrunSent = false;
+    m_underrunCount = 0;
+  }
+
+  size_t pushPcm(const uint8_t* data, size_t len) {
+    if (g_deviceMode != DeviceMode::STREAM) return 0;
+    if (m_state != StreamState::PREPARED &&
+        m_state != StreamState::BUFFERING &&
+        m_state != StreamState::PLAYING &&
+        m_state != StreamState::PAUSED) {
+      return 0;
+    }
+
+    if (m_state == StreamState::PREPARED) {
+      m_state = StreamState::BUFFERING;
+    }
+
+    const size_t fullChunk = (size_t)FRAMES_PER_WRITE * m_channels * 2;
+    if (len != fullChunk) {
+      return 0;
+    }
+
+    size_t written = g_streamRing.write(data, len);
+    if (written > 0) {
+      g_streamRxBytes += (uint32_t)written;
+    }
+    if (written == 0 && len > 0) {
+      g_streamDroppedBytes += (uint32_t)len;
+      uint32_t nowDrop = millis();
+      if ((nowDrop - g_lastDropLogMs) >= 1000) {
+        g_lastDropLogMs = nowDrop;
+        Serial.printf("[STREAM] drop %u bytes (free=%u total=%lu)\n",
+                      (unsigned)len, (unsigned)g_streamRing.freeBytes(),
+                      (unsigned long)g_streamDroppedBytes);
+      }
+      wsBroadcastBufferInfo();
+    }
+    return written;
+  }
+
+  void process() {
+    if (m_state == StreamState::BUFFERING && m_playRequested) {
+      if (g_streamRing.usedBytes() < streamMinStartBytes()) {
+        return;
+      }
+      if (!tdm_enable_output()) {
+        m_state = StreamState::ERROR;
+        wsRequestStreamStatus();
+        return;
+      }
+      m_state = StreamState::PLAYING;
+      m_streamNextBlockUs = micros();
+      wsRequestStreamStatus();
+      Serial.printf("[STREAM] PLAYING (buf=%u bytes, %uch)\n",
+                    (unsigned)g_streamRing.usedBytes(),
+                    (unsigned)m_channels);
+    }
+
+    if (m_state != StreamState::PLAYING) return;
+
+    for (uint32_t i = 0; i < 4; i++) {
+      if (!processOneAudioBlock()) break;
+    }
+
+    const uint32_t now = millis();
+    if ((now - m_lastStreamLogMs) >= 2000) {
+      m_lastStreamLogMs = now;
+      Serial.printf("[STREAM] buf used=%u free=%u rx=%lu underrun=%lu drop=%lu\n",
+                    (unsigned)g_streamRing.usedBytes(),
+                    (unsigned)g_streamRing.freeBytes(),
+                    (unsigned long)g_streamRxBytes,
+                    (unsigned long)m_underrunCount,
+                    (unsigned long)g_streamDroppedBytes);
+    }
+  }
+
+private:
+  bool processOneAudioBlock() {
+    const uint32_t bytesPerFrame = m_channels * 2;
+    const uint32_t wantBytes = FRAMES_PER_WRITE * bytesPerFrame;
+    const uint32_t blockUs = (uint32_t)((uint64_t)FRAMES_PER_WRITE * 1000000ULL / m_sampleRate);
+    const uint32_t nowUs = micros();
+
+    if ((int32_t)(nowUs - (uint32_t)m_streamNextBlockUs) < 0) {
+      return false;
+    }
+
+    const uint32_t avail = (uint32_t)g_streamRing.usedBytes();
+    const uint32_t now = millis();
+
+    if (avail > 0 && avail < wantBytes) {
+      return false;
+    }
+
+    if ((uint32_t)(nowUs - (uint32_t)m_streamNextBlockUs) > blockUs * 4) {
+      m_streamNextBlockUs = nowUs;
+    }
+    m_streamNextBlockUs += blockUs;
+
+    for (uint32_t i = 0; i < FRAMES_PER_WRITE * TDM_NUM_CH; ++i) {
+      g_tdmTxBuf[i] = 0;
+    }
+
+    if (avail >= wantBytes) {
+      size_t got = g_streamRing.read(g_streamPcmBuf, wantBytes);
+      if (got >= wantBytes) {
+        for (uint32_t f = 0; f < FRAMES_PER_WRITE; ++f) {
+          uint32_t srcBase = f * bytesPerFrame;
+          uint32_t dstBase = f * TDM_NUM_CH;
+          for (uint32_t ch = 0; ch < m_channels; ++ch) {
+            int16_t s = le16_to_s16(&g_streamPcmBuf[srcBase + ch * 2]);
+            g_tdmTxBuf[dstBase + ch] = apply_volume_127(s, g_volume);
+          }
+        }
+        m_underrunSent = false;
+      } else {
+        m_underrunCount++;
+        if (!m_underrunSent) {
+          Serial.printf("[STREAM] underrun (short read got=%u)\n", (unsigned)got);
+          wsRequestUnderrun();
+          m_underrunSent = true;
+        }
+      }
+    } else {
+      m_underrunCount++;
+      if (!m_underrunSent) {
+        wsRequestUnderrun();
+        m_underrunSent = true;
+      }
+      if ((now - m_lastUnderrunLogMs) >= 1000) {
+        m_lastUnderrunLogMs = now;
+        Serial.printf("[STREAM] underrun (avail=%u need=%u total=%lu)\n",
+                      (unsigned)avail, (unsigned)wantBytes,
+                      (unsigned long)m_underrunCount);
+      }
+    }
+
+    size_t bytesWritten = 0;
+    esp_err_t err = i2s_channel_write(
+        g_tx_handle,
+        g_tdmTxBuf,
+        FRAMES_PER_WRITE * BYTES_PER_TDM_FRAME,
+        &bytesWritten,
+        portMAX_DELAY);
+    if (err != ESP_OK) {
+      Serial.printf("[STREAM] i2s write error: %d\n", err);
+      stopInternal(true);
+      m_state = StreamState::ERROR;
+      wsRequestStreamStatus();
+      return false;
+    }
+    return true;
+  }
+
+  StreamState m_state = StreamState::IDLE;
+  uint32_t m_sampleRate = TDM_DEFAULT_SAMPLE_RATE;
+  uint32_t m_channels = 2;
+  uint32_t m_bits = 16;
+  bool m_underrunSent = false;
+  uint32_t m_underrunCount = 0;
+  uint32_t m_lastStreamLogMs = 0;
+  uint32_t m_lastUnderrunLogMs = 0;
+  bool m_playRequested = false;
+  uint64_t m_streamNextBlockUs = 0;
+
+  void stopInternal(bool clearBuffer) {
+    tdm_disable_output();
+    if (clearBuffer) {
+      g_streamRing.reset();
+      g_streamDroppedBytes = 0;
+    }
+    m_underrunSent = false;
+    m_underrunCount = 0;
+    m_playRequested = false;
+    m_state = StreamState::STOPPED;
+    m_state = StreamState::IDLE;
+  }
+};
+
+static StreamEngine g_streamEngine;
+static uint32_t g_lastBinBufferInfoMs = 0;
+static TaskHandle_t g_streamTaskHandle = nullptr;
+
+static void streamPlaybackTask(void* param) {
+  (void)param;
+  for (;;) {
+    if (g_deviceMode == DeviceMode::STREAM) {
+      g_streamEngine.process();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+static void ensureStreamPlaybackTask() {
+  if (g_streamTaskHandle) return;
+  xTaskCreatePinnedToCore(
+      streamPlaybackTask,
+      "streamAudio",
+      4096,
+      nullptr,
+      5,
+      &g_streamTaskHandle,
+      1);
+}
+
+static const char* streamStateToString(StreamState st) {
+  switch (st) {
+    case StreamState::IDLE:      return "IDLE";
+    case StreamState::PREPARED:  return "PREPARED";
+    case StreamState::BUFFERING: return "BUFFERING";
+    case StreamState::PLAYING:   return "PLAYING";
+    case StreamState::PAUSED:    return "PAUSED";
+    case StreamState::STOPPED:   return "STOPPED";
+    case StreamState::ERROR:     return "ERROR";
+    default:                     return "UNKNOWN";
+  }
+}
+
+static int jsonExtractInt(const String& msg, const char* key, int defVal) {
+  String needle = String("\"") + key + "\":";
+  int p = msg.indexOf(needle);
+  if (p < 0) return defVal;
+  return msg.substring(p + needle.length()).toInt();
+}
+
+// ====================================================
 // Player
 // ====================================================
 class UzuTdmPlayer {
@@ -1071,6 +1873,8 @@ public:
       return false;
     }
 
+    g_streamEngine.stop();
+    g_deviceMode = DeviceMode::SD;
     stop();
 
     File f = SD_MMC.open(g_fileList[index - 1].path, FILE_READ);
@@ -1428,6 +2232,196 @@ static void wsBroadcastState() {
   ws.broadcastTXT(st);
 }
 
+static void wsBroadcastStreamStatus() {
+  String st = "{\"cmd\":\"status\",\"state\":\"";
+  st += streamStateToString(g_streamEngine.state());
+  st += "\"}";
+  ws.broadcastTXT(st);
+}
+
+static void wsBroadcastBufferInfo() {
+  const size_t used = g_streamRing.usedBytes();
+  const size_t freeb = g_streamRing.freeBytes();
+  const size_t cap = g_streamRing.capacity();
+  const unsigned fillPct = (cap > 0) ? (unsigned)((used * 100ULL) / cap) : 0;
+
+  String st = "{\"cmd\":\"buffer_info\",\"freeBytes\":";
+  st += (unsigned long)freeb;
+  st += ",\"usedBytes\":";
+  st += (unsigned long)used;
+  st += ",\"bufferSize\":";
+  st += (unsigned long)cap;
+  st += ",\"fillPct\":";
+  st += fillPct;
+  st += ",\"underrunCount\":";
+  st += (unsigned long)g_streamEngine.underrunCount();
+  st += ",\"droppedBytes\":";
+  st += (unsigned long)g_streamEngine.droppedBytes();
+  const bool sendHold = (freeb < 6144) || (fillPct >= 80);
+  st += ",\"sendHold\":";
+  st += sendHold ? "true" : "false";
+  st += "}";
+  ws.broadcastTXT(st);
+}
+
+static void wsBroadcastUnderrun() {
+  ws.broadcastTXT("{\"cmd\":\"underrun\"}");
+}
+
+static volatile bool g_wsNotifyBufferInfo = false;
+static volatile bool g_wsNotifyStreamStatus = false;
+static volatile bool g_wsNotifyUnderrun = false;
+
+static void wsRequestStreamStatus() {
+  g_wsNotifyStreamStatus = true;
+}
+
+static void wsRequestBufferInfo() {
+  g_wsNotifyBufferInfo = true;
+}
+
+static void wsRequestUnderrun() {
+  g_wsNotifyUnderrun = true;
+}
+
+static void wsProcessNotifications() {
+  static uint32_t s_lastBufferInfoMs = 0;
+  const uint32_t now = millis();
+
+  if (g_wsNotifyStreamStatus) {
+    g_wsNotifyStreamStatus = false;
+    wsBroadcastStreamStatus();
+  }
+  if (g_wsNotifyUnderrun) {
+    g_wsNotifyUnderrun = false;
+    wsBroadcastUnderrun();
+  }
+  if (g_wsNotifyBufferInfo && (now - s_lastBufferInfoMs) >= 50) {
+    g_wsNotifyBufferInfo = false;
+    s_lastBufferInfoMs = now;
+    wsBroadcastBufferInfo();
+  }
+}
+
+static bool handleStreamTextCommand(uint8_t num, const String& msg) {
+  if (msg.indexOf("\"cmd\":\"vol\"") >= 0) {
+    int p = msg.indexOf("value");
+    if (p >= 0) {
+      int c = msg.indexOf(":", p);
+      if (c >= 0) {
+        int v = msg.substring(c + 1).toInt();
+        if (v < 0) v = 0;
+        if (v > 127) v = 127;
+        g_volume = (uint8_t)v;
+      }
+    }
+    wsBroadcastState();
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"set_mode\"") >= 0) {
+    if (msg.indexOf("\"STREAM\"") >= 0) {
+      g_player.stop();
+      g_deviceMode = DeviceMode::STREAM;
+      g_streamEngine.reset();
+    } else {
+      g_streamEngine.stop();
+      g_deviceMode = DeviceMode::SD;
+    }
+    wsBroadcastStreamStatus();
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"file_info\"") >= 0) {
+    if (msg.indexOf("\"sampleRate\"") >= 0) {
+      g_streamPendingSampleRate = (uint32_t)jsonExtractInt(msg, "sampleRate", TDM_DEFAULT_SAMPLE_RATE);
+    }
+    if (msg.indexOf("\"channels\"") >= 0) {
+      g_streamPendingChannels = (uint32_t)jsonExtractInt(msg, "channels", 2);
+    }
+    if (msg.indexOf("\"bitsPerSample\"") >= 0) {
+      g_streamPendingBits = (uint32_t)jsonExtractInt(msg, "bitsPerSample", 16);
+    }
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"prepare\"") >= 0) {
+    g_player.stop();
+    if (!g_streamEngine.prepare(
+            g_streamPendingSampleRate,
+            g_streamPendingChannels,
+            g_streamPendingBits)) {
+      ws.sendTXT(num, "{\"cmd\":\"error\",\"message\":\"Invalid format\"}");
+      wsBroadcastStreamStatus();
+      return true;
+    }
+
+    g_deviceMode = DeviceMode::STREAM;
+    wsBroadcastStreamStatus();
+    wsBroadcastBufferInfo();
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"start\"") >= 0) {
+    if (!g_streamEngine.start()) {
+      ws.sendTXT(num, "{\"cmd\":\"error\",\"message\":\"Start failed\"}");
+      wsBroadcastStreamStatus();
+      return true;
+    }
+    wsBroadcastStreamStatus();
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"stop\"") >= 0) {
+    if (g_deviceMode == DeviceMode::STREAM) {
+      g_streamEngine.stop();
+      wsBroadcastStreamStatus();
+      ws.sendTXT(num, "{\"type\":\"ack\"}");
+      return true;
+    }
+    return false;
+  }
+
+  if (msg.indexOf("\"cmd\":\"pause\"") >= 0) {
+    if (g_deviceMode == DeviceMode::STREAM) {
+      g_streamEngine.pause();
+      wsBroadcastStreamStatus();
+      ws.sendTXT(num, "{\"type\":\"ack\"}");
+      return true;
+    }
+    return false;
+  }
+
+  if (msg.indexOf("\"cmd\":\"resume\"") >= 0) {
+    if (g_deviceMode == DeviceMode::STREAM) {
+      g_streamEngine.resume();
+      wsBroadcastStreamStatus();
+      ws.sendTXT(num, "{\"type\":\"ack\"}");
+      return true;
+    }
+    return false;
+  }
+
+  if (msg.indexOf("\"cmd\":\"reset_buffer\"") >= 0) {
+    g_streamEngine.resetBuffer();
+    wsBroadcastBufferInfo();
+    ws.sendTXT(num, "{\"type\":\"ack\"}");
+    return true;
+  }
+
+  if (msg.indexOf("\"cmd\":\"ping\"") >= 0) {
+    ws.sendTXT(num, "{\"cmd\":\"pong\"}");
+    return true;
+  }
+
+  return false;
+}
+
 static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
@@ -1438,13 +2432,25 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
       break;
 
     case WStype_DISCONNECTED:
-      Serial.printf("[WS] Client #%u disconnected\n", num);
+      Serial.printf("[WS] Client #%u disconnected", num);
+      if (length >= 2) {
+        const uint16_t reason = ((uint16_t)payload[0] << 8) | payload[1];
+        Serial.printf(" code=%u", (unsigned)reason);
+      }
+      Serial.println();
+      if (g_deviceMode == DeviceMode::STREAM && ws.connectedClients() == 0) {
+        g_streamEngine.stop();
+        g_deviceMode = DeviceMode::SD;
+        Serial.println("[STREAM] stopped (client disconnected)");
+      }
       break;
 
     case WStype_TEXT: {
       String msg;
       msg.reserve(length + 1);
       for (size_t i = 0; i < length; i++) msg += (char)payload[i];
+
+      if (handleStreamTextCommand(num, msg)) return;
 
       if (msg.indexOf("\"cmd\":\"get_tracks\"") >= 0) {
         wsSendTracks(num);
@@ -1473,7 +2479,10 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
       }
 
       if (msg.indexOf("\"cmd\":\"play\"") >= 0) {
-        if (g_fileCount > 0) g_player.playIndex(g_selectedTrack0 + 1);
+        if (g_deviceMode != DeviceMode::STREAM && g_fileCount > 0) {
+          g_streamEngine.stop();
+          g_player.playIndex(g_selectedTrack0 + 1);
+        }
       }
       else if (msg.indexOf("\"cmd\":\"stop\"") >= 0) {
         g_player.stop();
@@ -1530,6 +2539,19 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 
       wsBroadcastState();
       ws.sendTXT(num, "{\"type\":\"ack\"}");
+      break;
+    }
+
+    case WStype_BIN: {
+      size_t written = g_streamEngine.pushPcm(payload, length);
+      if (written > 0) {
+        uint32_t now = millis();
+        const uint32_t infoInterval = 50u;
+        if ((now - g_lastBinBufferInfoMs) >= infoInterval) {
+          g_lastBinBufferInfoMs = now;
+          wsBroadcastBufferInfo();
+        }
+      }
       break;
     }
 
@@ -1712,6 +2734,8 @@ private:
 
   void cmdHelp() {
     println("OK HELP");
+    m_serial->print("  BUILD         : ");
+    m_serial->println(FIRMWARE_BUILD);
     m_serial->print("  AP SSID       : ");
     m_serial->println(AP_SSID);
     m_serial->print("  AP PASSWORD   : ");
@@ -2069,6 +3093,13 @@ static void performSystemInit(bool verbose) {
   clearFileList();
   g_selectedTrack0 = 0;
   g_selectedLenMs = 0;
+  g_deviceMode = DeviceMode::SD;
+  g_streamEngine.reset();
+  g_streamPendingSampleRate = TDM_DEFAULT_SAMPLE_RATE;
+  g_streamPendingChannels = 2;
+  g_streamPendingBits = 16;
+  g_streamDroppedBytes = 0;
+  g_streamRxBytes = 0;
 
   g_mounted = mount_sdmmc_4bit(g_sd_freq_hz);
   if (verbose) {
@@ -2101,10 +3132,12 @@ static void performSystemInit(bool verbose) {
 
   ws.begin();
   ws.onEvent(onWsEvent);
-  ws.enableHeartbeat(15000, 3000, 2);
+  ws.enableHeartbeat(30000, 5000, 3);
   if (verbose) {
     Serial.println("HTTP + WebSocket server started on port 80.");
   }
+
+  ensureStreamPlaybackTask();
 }
 
 static void shutdownNetworkServices() {
@@ -2120,7 +3153,12 @@ static void shutdownNetworkServices() {
 // ====================================================
 void setup() {
   Serial.begin(115200);
+  delay(100);
+  Serial.println();
   Serial.println(VERSION_STRING);
+  Serial.print("Build: ");
+  Serial.println(FIRMWARE_BUILD);
+  Serial.println();
   delay(100);
 
   g_power.begin();
@@ -2128,6 +3166,8 @@ void setup() {
 
   Serial.println();
   Serial.println("UZU Player + TDM + WiFi Control + Power");
+  Serial.print("Firmware Build: ");
+  Serial.println(FIRMWARE_BUILD);
   Serial.println("Type HELP or ?");
 
   performSystemInit(true);
@@ -2139,6 +3179,7 @@ void loop() {
   g_power.process();
 
   if (g_power.isPoweredOff()) {
+    g_streamEngine.stop();
     g_player.stop();
     delay(10);
     while (1) {
@@ -2147,8 +3188,12 @@ void loop() {
   }
 
   g_parser.process();
-  g_player.process();
 
   dns.processNextRequest();
   ws.loop();
+  wsProcessNotifications();
+
+  if (g_deviceMode != DeviceMode::STREAM) {
+    g_player.process();
+  }
 }
