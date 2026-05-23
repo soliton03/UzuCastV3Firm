@@ -25,7 +25,7 @@ USB CDC On Boot:  用途に応じて（USB シリアルなら Enabled）
 #endif
 
 #define VERSION_STRING   "UZU CAST Version 1.00"
-#define FIRMWARE_BUILD   10025
+#define FIRMWARE_BUILD   10028
 #define FIRMWARE_BUILD_STR_HELPER(x) #x
 #define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 // ====================================================
@@ -58,6 +58,9 @@ static bool handleStreamTextCommand(uint8_t num, const String& msg);
 
 static const char* getCardTypeString();
 static bool mount_sdmmc_4bit(uint32_t freq_hz);
+static void unmount_sdmmc();
+static void mountAndScanSdCard(bool verbose);
+static void processSdCardDetect();
 static void clearFileList();
 static int16_t apply_volume_127(int16_t sample, uint8_t vol);
 
@@ -69,6 +72,7 @@ static bool tdm_enable_output();
 static void tdm_disable_output();
 
 static void wsSendTracks(uint8_t clientId);
+static void wsBroadcastTracks();
 static void wsSendState(uint8_t clientId);
 static void wsBroadcastState();
 static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
@@ -97,6 +101,16 @@ static const int PIN_SD_CD  = 21;   // LOW = inserted
 
 static uint32_t g_sd_freq_hz = 20000000; // 20MHz
 static bool g_mounted = false;
+static bool g_sdCardPresent = false;
+static bool g_sdRemountPending = false;
+static uint32_t g_sdRemountAtMs = 0;
+static uint32_t g_sdCdLastPollMs = 0;
+static bool g_sdCdLastRead = false;
+static uint32_t g_sdCdStableSinceMs = 0;
+
+static constexpr uint32_t SD_CD_POLL_MS = 200;
+static constexpr uint32_t SD_CD_DEBOUNCE_MS = 50;
+static constexpr uint32_t SD_INSERT_SETTLE_MS = 300;
 
 // ====================================================
 // WiFi AP / DNS
@@ -344,6 +358,8 @@ static const char kHtml[] PROGMEM = R"HTML(
     pre.mono { white-space: pre-wrap; margin: 8px 0 0 0; }
     .status { display: inline-block; padding: 6px 10px; border-radius: 999px; border: 1px solid #999; }
     select:disabled { opacity: 0.6; }
+    input[type="file"] { max-width: 100%; }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
@@ -359,7 +375,21 @@ static const char kHtml[] PROGMEM = R"HTML(
   <div class="card">
     <h2>1) 曲の選択</h2>
     <div class="row">
-      <select id="trackSelect"></select>
+      <label for="sourceModeSelect">ソース:</label>
+      <select id="sourceModeSelect">
+        <option value="SD">SDカード</option>
+        <option value="FILE">ブラウザファイル</option>
+      </select>
+    </div>
+    <div id="sdSourcePanel">
+      <div class="row">
+        <select id="trackSelect"></select>
+      </div>
+    </div>
+    <div id="fileSourcePanel" class="hidden">
+      <div class="row">
+        <input id="fileInput" type="file" accept=".uzu,.UZU">
+      </div>
     </div>
     <div class="mono" id="selectedTrack">Selected: -</div>
     <div class="row">
@@ -431,8 +461,20 @@ static const char kHtml[] PROGMEM = R"HTML(
   const bufferMonitor = $("bufferMonitor");
   const underrunMonitor = $("underrunMonitor");
   const dropMonitor = $("dropMonitor");
+  const sourceModeSelect = $("sourceModeSelect");
+  const sdSourcePanel = $("sdSourcePanel");
+  const fileSourcePanel = $("fileSourcePanel");
+  const fileInput = $("fileInput");
 
   let ws;
+  let sourceMode = "SD";
+  let browserFile = null;
+  let fileStreamActive = false;
+  let fileStreamStartPending = false;
+  let fileStreamPaused = false;
+  let fileSendPos = 0;
+  let pcmSendTimer = null;
+  let pcmPumpFn = null;
   let currentTrackIndex = 0;
   let currentLenMs = 0;
   let currentPlayState = "STOP";
@@ -449,7 +491,6 @@ static const char kHtml[] PROGMEM = R"HTML(
   const TEST_CHANNEL_MODES = [2, 5, 8];
   let testToneChannels = 5;
   let testTonePhases = [0, 0, 0, 0, 0, 0, 0, 0];
-  let testToneSendTimer = null;
   let testToneStartPending = false;
   let testToneFillPct = 0;
   let testToneResumeAfterReconnect = false;
@@ -483,10 +524,28 @@ static const char kHtml[] PROGMEM = R"HTML(
     return TEST_SAMPLE_RATE * testToneChannels * 2;
   }
 
-  function testBandTier(){
-    if(testToneChannels >= 8) return 2;
-    if(testToneChannels >= 5) return 1;
+  function bandTierForChannels(ch){
+    if(ch >= 8) return 2;
+    if(ch >= 5) return 1;
     return 0;
+  }
+
+  function pumpIntervalMsForChannels(ch){
+    const tier = bandTierForChannels(ch);
+    if(tier >= 2) return 5;
+    if(tier >= 1) return 8;
+    return 10;
+  }
+
+  function wsBufferMaxForChannels(ch){
+    const tier = bandTierForChannels(ch);
+    if(tier >= 2) return 65536;
+    if(tier >= 1) return 49152;
+    return 32768;
+  }
+
+  function testBandTier(){
+    return bandTierForChannels(testToneChannels);
   }
 
   function testPumpIntervalMs(){
@@ -520,29 +579,37 @@ static const char kHtml[] PROGMEM = R"HTML(
       "Rate: " + testDataRate() + " B/s (" + kbps + " kbps), chunk " + testChunkBytes() + " B";
   }
 
-  function updateTestWatermarks(){
+  function updateStreamWatermarks(channels){
     const cap = testToneBufferSize > 0 ? testToneBufferSize : 1048576;
-    const chunk = testChunkBytes();
+    const chunk = 256 * channels * 2;
     testPrefillTarget = Math.max(chunk * 8, Math.floor(cap / 3));
     testLowWater = Math.max(chunk * 8, Math.floor(cap * 0.30));
     testHighWater = Math.floor(cap * 0.50);
   }
 
-  function maxPumpChunks(){
+  function updateTestWatermarks(){
+    updateStreamWatermarks(testToneChannels);
+  }
+
+  function maxPumpChunksForChannels(channels){
     if(testToneFillPct >= 70) return 1;
-    if(testToneChannels >= 8){
-      if(testToneStartPending) return 6;
+    if(channels >= 8){
+      if(testToneStartPending || fileStreamStartPending) return 6;
       if(testToneUsedBytes < testLowWater) return 4;
       return 3;
     }
-    if(testToneChannels >= 5){
-      if(testToneStartPending) return 6;
+    if(channels >= 5){
+      if(testToneStartPending || fileStreamStartPending) return 6;
       if(testToneUsedBytes < testLowWater) return 4;
       return 3;
     }
-    if(testToneStartPending) return 6;
+    if(testToneStartPending || fileStreamStartPending) return 6;
     if(testToneUsedBytes < testLowWater) return 4;
     return 2;
+  }
+
+  function maxPumpChunks(){
+    return maxPumpChunksForChannels(testToneChannels);
   }
 
   function mmss(ms){
@@ -561,8 +628,127 @@ static const char kHtml[] PROGMEM = R"HTML(
     volLabel.textContent = "VOL=" + (parseInt(vol.value,10)||0);
   }
 
+  function updatePlaybackLock(){
+    const sdBusy = sourceMode === "SD" && (currentPlayState === "PLAY" || currentPlayState === "PAUSE");
+    const fileBusy = sourceMode === "FILE" && fileStreamActive;
+    const busy = sdBusy || fileBusy || testToneActive;
+    trackSelect.disabled = busy;
+    fileInput.disabled = busy;
+    sourceModeSelect.disabled = busy;
+  }
+
   function updateTrackLock(){
-    trackSelect.disabled = (currentPlayState === "PLAY" || currentPlayState === "PAUSE");
+    updatePlaybackLock();
+  }
+
+  function readFixedUzuString(view, offset, len){
+    let end = 0;
+    for(let i = 0; i < len; i++){
+      if(view.getUint8(offset + i) === 0) break;
+      end = i + 1;
+    }
+    while(end > 0){
+      const c = view.getUint8(offset + end - 1);
+      if(c === 0x20 || c === 0x09 || c === 0x0d || c === 0x0a) end--;
+      else break;
+    }
+    if(end <= 0) return "";
+    const slice = new Uint8Array(view.buffer, view.byteOffset + offset, end);
+    return new TextDecoder("utf-8").decode(slice);
+  }
+
+  function parseUzuBuffer(buf, fileName){
+    if(buf.byteLength < 32768) throw new Error("ファイルが小さすぎます");
+    const view = new DataView(buf);
+    let magic = "";
+    for(let i = 0; i < 8; i++) magic += String.fromCharCode(view.getUint8(i));
+    if(magic !== "UZUCPW1\u0000") throw new Error("UZUマジック不一致");
+
+    const dataStart = view.getUint32(8, true);
+    const channels = view.getUint32(12, true);
+    const sampleRate = view.getUint32(16, true);
+    const bits = view.getUint32(20, true);
+    const totalSamples = view.getUint32(24, true);
+
+    if(dataStart < 32768) throw new Error("dataStart が不正です");
+    if(channels === 0 || channels > 8) throw new Error("チャンネル数が未対応です");
+    if(bits !== 16) throw new Error("16bit のみ対応です");
+    if(sampleRate !== 44100 && sampleRate !== 48000) throw new Error("サンプルレート未対応です");
+    if(dataStart >= buf.byteLength) throw new Error("データ開始位置が不正です");
+
+    const title = readFixedUzuString(view, 28, 256);
+    const channelNames = [];
+    for(let i = 0; i < channels && i < 8; i++){
+      channelNames.push(readFixedUzuString(view, 284 + i * 256, 256));
+    }
+    const lengthMs = Math.floor((totalSamples * 1000) / sampleRate);
+
+    return {
+      valid: true,
+      name: fileName || "local.UZU",
+      title,
+      channels,
+      sampleRate,
+      bits,
+      totalSamples,
+      lengthMs,
+      dataStart,
+      channelNames,
+      buffer: buf
+    };
+  }
+
+  function msToFilePos(ms){
+    if(!browserFile) return 0;
+    const sample = Math.floor((Math.max(0, ms|0) * browserFile.sampleRate) / 1000);
+    const clamped = Math.min(sample, browserFile.totalSamples);
+    return browserFile.dataStart + clamped * browserFile.channels * 2;
+  }
+
+  function filePosToMs(pos){
+    if(!browserFile) return 0;
+    const rel = Math.max(0, pos - browserFile.dataStart);
+    const samples = Math.floor(rel / (browserFile.channels * 2));
+    return Math.floor((samples * 1000) / browserFile.sampleRate);
+  }
+
+  function notifyEspFileHeader(meta){
+    send({cmd:"set_mode", mode:"STREAM"});
+    send({cmd:"file_info", name:meta.name, sampleRate:meta.sampleRate, bitsPerSample:16, channels:meta.channels, durationMs:meta.lengthMs});
+    send({cmd:"prepare"});
+  }
+
+  function releaseEspStreamIfPrepared(){
+    send({cmd:"stop"});
+    send({cmd:"reset_buffer"});
+    send({cmd:"set_mode", mode:"SD"});
+  }
+
+  function updateSourceModeUi(){
+    const isSd = sourceMode === "SD";
+    sdSourcePanel.classList.toggle("hidden", !isSd);
+    fileSourcePanel.classList.toggle("hidden", isSd);
+    sourceModeSelect.value = sourceMode;
+    updatePlaybackLock();
+  }
+
+  function showTrackInfo(msg){
+    trackInfo.textContent = formatTrackInfo(msg);
+  }
+
+  function startPcmPump(fn, intervalMs){
+    stopPcmPump();
+    pcmPumpFn = fn;
+    pcmSendTimer = setInterval(()=>{
+      if(pcmPumpFn) pcmPumpFn();
+    }, intervalMs);
+  }
+
+  function stopPcmPump(){
+    if(!pcmSendTimer) return;
+    clearInterval(pcmSendTimer);
+    pcmSendTimer = null;
+    pcmPumpFn = null;
   }
 
   function formatTrackInfo(msg){
@@ -601,9 +787,11 @@ static const char kHtml[] PROGMEM = R"HTML(
     const total = testToneBufferSize|0;
     const free = testToneFreeBytes|0;
     const pct = total > 0 ? Math.round((used * 100) / total) : 0;
+    const chLabel = fileStreamActive && browserFile ? (browserFile.channels + "ch file")
+      : (testToneChannels + "ch test");
     bufferMonitor.textContent =
       "Buffer: used " + used + " / " + total + " (" + pct + "%), free " + free +
-      ", CH=" + testToneChannels + ", sent " + (testToneChunksSent|0);
+      ", " + chLabel + ", sent " + (testToneChunksSent|0);
     underrunMonitor.textContent = "Underrun: " + (testToneUnderrunCount|0);
     dropMonitor.textContent = "Dropped: " + (testToneDroppedBytes|0) + " bytes";
   }
@@ -667,9 +855,10 @@ static const char kHtml[] PROGMEM = R"HTML(
     testToneState.textContent = "Test: ON (" + testToneChannels + "ch 440Hz) / PLAYING";
   }
 
-  function onTestToneBufferInfo(msg){
+  function onStreamBufferInfo(msg){
     if(typeof msg.bufferSize === "number") testToneBufferSize = msg.bufferSize;
-    updateTestWatermarks();
+    const ch = fileStreamActive && browserFile ? browserFile.channels : testToneChannels;
+    updateStreamWatermarks(ch);
     if(typeof msg.freeBytes === "number") testToneFreeBytes = msg.freeBytes;
     if(typeof msg.usedBytes === "number") testToneUsedBytes = msg.usedBytes;
     if(typeof msg.fillPct === "number") testToneFillPct = msg.fillPct;
@@ -691,25 +880,25 @@ static const char kHtml[] PROGMEM = R"HTML(
     }
     updateBufferMonitor();
     maybeStartTestPlayback();
+    maybeStartFilePlayback();
   }
 
   function restartTestToneSendTimer(){
-    stopTestToneSendTimer();
-    startTestToneSendTimer();
+    stopPcmPump();
+    startPcmPump(pumpTestPcm, testPumpIntervalMs());
   }
 
   function startTestToneSendTimer(){
-    if(testToneSendTimer) return;
-    testToneSendTimer = setInterval(pumpTestPcm, testPumpIntervalMs());
+    if(pcmSendTimer && pcmPumpFn === pumpTestPcm) return;
+    startPcmPump(pumpTestPcm, testPumpIntervalMs());
   }
 
   function stopTestToneSendTimer(){
-    if(!testToneSendTimer) return;
-    clearInterval(testToneSendTimer);
-    testToneSendTimer = null;
+    if(pcmPumpFn === pumpTestPcm) stopPcmPump();
   }
 
   function startTestTone(){
+    if(fileStreamActive) stopFilePlayback();
     send({cmd:"set_mode", mode:"STREAM"});
     send({cmd:"file_info", name:"test.wav", sampleRate:TEST_SAMPLE_RATE, bitsPerSample:16, channels:testToneChannels});
     send({cmd:"prepare"});
@@ -751,6 +940,205 @@ static const char kHtml[] PROGMEM = R"HTML(
     send({cmd:"set_mode", mode:"SD"});
   }
 
+  function fileChunkBytes(){
+    return browserFile ? (256 * browserFile.channels * 2) : 0;
+  }
+
+  function buildFilePcmChunk(){
+    if(!browserFile) return null;
+    const chunkBytes = fileChunkBytes();
+    const remain = browserFile.buffer.byteLength - fileSendPos;
+    if(remain <= 0) return null;
+    const buf = new ArrayBuffer(chunkBytes);
+    const out = new Uint8Array(buf);
+    const copyLen = Math.min(remain, chunkBytes);
+    out.set(new Uint8Array(browserFile.buffer, fileSendPos, copyLen));
+    fileSendPos += copyLen;
+    return buf;
+  }
+
+  function canSendFilePcm(){
+    if(!fileStreamActive || fileStreamPaused || !browserFile || !ws || ws.readyState !== WebSocket.OPEN) return false;
+    if(Date.now() < testToneBackoffUntil) return false;
+    if(ws.bufferedAmount > wsBufferMaxForChannels(browserFile.channels)) return false;
+    const chunk = fileChunkBytes();
+    if(testToneFreeBytes < (chunk + TEST_SEND_MARGIN)) return false;
+    if(fileSendPos >= browserFile.buffer.byteLength) return false;
+    return true;
+  }
+
+  function sendFileChunks(maxCount){
+    let sent = 0;
+    const chunk = fileChunkBytes();
+    while(sent < maxCount){
+      if(!canSendFilePcm()) break;
+      const pcm = buildFilePcmChunk();
+      if(!pcm) break;
+      ws.send(pcm);
+      testToneFreeBytes -= chunk;
+      testToneUsedBytes += chunk;
+      testToneChunksSent++;
+      sent++;
+    }
+    return sent;
+  }
+
+  function pumpFilePcm(){
+    if(!fileStreamActive || fileStreamPaused) return;
+    if(!browserFile) return;
+    if(ws.bufferedAmount > wsBufferMaxForChannels(browserFile.channels)) return;
+    sendFileChunks(maxPumpChunksForChannels(browserFile.channels));
+    maybeStartFilePlayback();
+    if(fileStreamActive && !fileStreamStartPending){
+      const posMs = filePosToMs(fileSendPos);
+      seek.value = String(Math.min(posMs, currentLenMs));
+      updateSeekLabel();
+    }
+    if(fileSendPos >= browserFile.buffer.byteLength && !fileStreamStartPending){
+      endFilePlaybackAtEof();
+    }
+  }
+
+  function maybeStartFilePlayback(){
+    if(!fileStreamStartPending) return;
+    if(testToneUsedBytes < testPrefillTarget) return;
+    fileStreamStartPending = false;
+    send({cmd:"start"});
+    currentPlayState = "PLAY";
+    playState.textContent = "State: PLAY";
+    updatePlaybackLock();
+  }
+
+  function startFilePlayback(){
+    if(!browserFile) return;
+    if(testToneActive) stopTestTone();
+    notifyEspFileHeader(browserFile);
+    fileStreamActive = true;
+    fileStreamPaused = false;
+    fileStreamStartPending = true;
+    fileSendPos = msToFilePos(parseInt(seek.value, 10) || 0);
+    testToneUnderrunCount = 0;
+    testToneDroppedBytes = 0;
+    testToneLastDroppedBytes = 0;
+    testToneBackoffUntil = 0;
+    testToneChunksSent = 0;
+    updateStreamWatermarks(browserFile.channels);
+    currentPlayState = "PLAY";
+    playState.textContent = "State: BUFFERING";
+    updatePlaybackLock();
+    startPcmPump(pumpFilePcm, pumpIntervalMsForChannels(browserFile.channels));
+  }
+
+  function stopFilePlaybackLocal(){
+    stopPcmPump();
+    fileStreamActive = false;
+    fileStreamStartPending = false;
+    fileStreamPaused = false;
+    currentPlayState = "STOP";
+    playState.textContent = "State: STOP";
+    testToneFreeBytes = testToneBufferSize;
+    testToneUsedBytes = 0;
+    updatePlaybackLock();
+  }
+
+  function stopFilePlayback(){
+    stopFilePlaybackLocal();
+    releaseEspStreamIfPrepared();
+  }
+
+  function pauseFilePlayback(){
+    if(!fileStreamActive || fileStreamPaused) return;
+    fileStreamPaused = true;
+    stopPcmPump();
+    send({cmd:"pause"});
+    currentPlayState = "PAUSE";
+    playState.textContent = "State: PAUSE";
+    updatePlaybackLock();
+  }
+
+  function resumeFilePlayback(){
+    if(!fileStreamActive || !fileStreamPaused || !browserFile) return;
+    fileStreamPaused = false;
+    send({cmd:"resume"});
+    currentPlayState = "PLAY";
+    playState.textContent = "State: PLAY";
+    startPcmPump(pumpFilePcm, pumpIntervalMsForChannels(browserFile.channels));
+    updatePlaybackLock();
+  }
+
+  function endFilePlaybackAtEof(){
+    stopPcmPump();
+    fileStreamActive = false;
+    fileStreamStartPending = false;
+    fileStreamPaused = false;
+    currentPlayState = "STOP";
+    playState.textContent = "State: STOP (END)";
+    send({cmd:"stop"});
+    updatePlaybackLock();
+  }
+
+  function applyFileSeek(posMs){
+    if(!browserFile) return;
+    fileSendPos = msToFilePos(posMs);
+    seek.value = String(Math.max(0, Math.min(posMs, currentLenMs)));
+    updateSeekLabel();
+    if(!fileStreamActive) return;
+    send({cmd:"reset_buffer"});
+    testToneUsedBytes = 0;
+    testToneFreeBytes = testToneBufferSize;
+    testToneUnderrunCount = 0;
+    testToneChunksSent = 0;
+    if(!fileStreamPaused){
+      startPcmPump(pumpFilePcm, pumpIntervalMsForChannels(browserFile.channels));
+    }
+  }
+
+  function loadBrowserFile(file){
+    return file.arrayBuffer().then((buf)=>{
+      browserFile = parseUzuBuffer(buf, file.name);
+      selectedTrack.textContent = "Selected: " + browserFile.name;
+      showTrackInfo(browserFile);
+      currentLenMs = browserFile.lengthMs;
+      seek.max = String(currentLenMs > 0 ? currentLenMs : 1);
+      seek.value = "0";
+      fileSendPos = browserFile.dataStart;
+      updateSeekLabel();
+      notifyEspFileHeader(browserFile);
+      if(!detailVisible){
+        detailVisible = true;
+        trackInfo.style.display = "block";
+        btnToggleInfo.textContent = "詳細非表示";
+      }
+    });
+  }
+
+  function setSourceMode(mode){
+    if(mode !== "SD" && mode !== "FILE") mode = "SD";
+    if(mode === sourceMode) return;
+    if(testToneActive) stopTestTone();
+    if(fileStreamActive) stopFilePlayback();
+    else if(sourceMode === "FILE" && browserFile) releaseEspStreamIfPrepared();
+    if(sourceMode === "SD" && (currentPlayState === "PLAY" || currentPlayState === "PAUSE")){
+      send({cmd:"stop"});
+    }
+
+    sourceMode = mode;
+    browserFile = null;
+    fileInput.value = "";
+    selectedTrack.textContent = "Selected: -";
+    trackInfo.textContent = "Info: -";
+    currentLenMs = 0;
+    seek.value = "0";
+    seek.max = "300000";
+    updateSeekLabel();
+
+    if(sourceMode === "SD"){
+      send({cmd:"get_tracks"});
+      send({cmd:"get_state"});
+    }
+    updateSourceModeUi();
+  }
+
   function connectWS(){
     const host = window.location.hostname || "192.168.4.1";
     const url = "ws://" + host + "/";
@@ -773,6 +1161,7 @@ static const char kHtml[] PROGMEM = R"HTML(
     ws.onclose = (ev)=>{
       testToneResumeAfterReconnect = testToneActive;
       stopTestToneLocal();
+      stopFilePlaybackLocal();
       wsState.textContent = "WS: CLOSED code=" + ev.code;
       setTimeout(connectWS, 1000);
     };
@@ -789,15 +1178,32 @@ static const char kHtml[] PROGMEM = R"HTML(
         const msg = JSON.parse(ev.data);
 
         if(msg.cmd === "buffer_info"){
-          onTestToneBufferInfo(msg);
+          onStreamBufferInfo(msg);
           return;
         }
 
         if(msg.cmd === "status"){
           if(typeof msg.state === "string"){
-            testToneState.textContent = testToneActive
-              ? ("Test: ON (" + testToneChannels + "ch 440Hz) / " + msg.state)
-              : ("Test: OFF / " + msg.state);
+            if(testToneActive){
+              testToneState.textContent = "Test: ON (" + testToneChannels + "ch 440Hz) / " + msg.state;
+            } else {
+              testToneState.textContent = "Test: OFF / " + msg.state;
+            }
+            if(fileStreamActive){
+              if(msg.state === "PLAYING"){
+                currentPlayState = fileStreamPaused ? "PAUSE" : "PLAY";
+              } else if(msg.state === "PAUSED"){
+                currentPlayState = "PAUSE";
+              } else if(msg.state === "BUFFERING"){
+                currentPlayState = "PLAY";
+                playState.textContent = "State: BUFFERING";
+                return;
+              } else if(msg.state === "STOPPED" || msg.state === "IDLE"){
+                if(!fileStreamStartPending) currentPlayState = "STOP";
+              }
+              playState.textContent = "State: " + (fileStreamPaused ? "PAUSE" : currentPlayState);
+              updatePlaybackLock();
+            }
           }
           return;
         }
@@ -809,6 +1215,7 @@ static const char kHtml[] PROGMEM = R"HTML(
         }
 
         if(msg.type === "tracks" && Array.isArray(msg.items)){
+          if(sourceMode !== "SD") return;
           trackSelect.innerHTML = "";
           msg.items.forEach((name, idx)=>{
             const opt = document.createElement("option");
@@ -830,11 +1237,13 @@ static const char kHtml[] PROGMEM = R"HTML(
         }
 
         if(msg.type === "track_info") {
+          if(sourceMode !== "SD") return;
           trackInfo.textContent = formatTrackInfo(msg);
           return;
         }
 
         if(msg.type === "state"){
+          if(sourceMode !== "SD" && fileStreamActive) return;
           if(typeof msg.play === "string") {
             currentPlayState = msg.play;
             playState.textContent = "State: " + msg.play;
@@ -874,7 +1283,10 @@ static const char kHtml[] PROGMEM = R"HTML(
 
   connectWS();
 
+  updateSourceModeUi();
+
   trackSelect.onchange = ()=>{
+    if(sourceMode !== "SD") return;
     if (trackSelect.disabled) return;
 
     currentTrackIndex = parseInt(trackSelect.value,10) || 0;
@@ -892,19 +1304,56 @@ static const char kHtml[] PROGMEM = R"HTML(
     detailVisible = !detailVisible;
     trackInfo.style.display = detailVisible ? "block" : "none";
     btnToggleInfo.textContent = detailVisible ? "詳細非表示" : "詳細表示";
-    if (detailVisible) {
+    if (detailVisible && sourceMode === "SD") {
       send({cmd:"get_info", trackIndex: currentTrackIndex});
     }
   };
 
-  $("btnPlay").onclick = ()=> send({cmd:"play"});
-  $("btnStop").onclick = ()=> send({cmd:"stop"});
-  $("btnPause").onclick = ()=> send({cmd:"pause"});
+  sourceModeSelect.onchange = ()=>{
+    setSourceMode(sourceModeSelect.value);
+  };
+
+  fileInput.onchange = ()=>{
+    const file = fileInput.files && fileInput.files[0];
+    if(!file) return;
+    if(fileStreamActive) stopFilePlayback();
+    loadBrowserFile(file).catch((err)=>{
+      browserFile = null;
+      alert("UZU読込エラー: " + err.message);
+    });
+  };
+
+  $("btnPlay").onclick = ()=>{
+    if(sourceMode === "SD"){
+      send({cmd:"play"});
+      return;
+    }
+    if(!browserFile){
+      alert("UZUファイルを選択してください");
+      return;
+    }
+    if(fileStreamActive && fileStreamPaused) resumeFilePlayback();
+    else if(!fileStreamActive) startFilePlayback();
+  };
+
+  $("btnStop").onclick = ()=>{
+    if(sourceMode === "SD") send({cmd:"stop"});
+    else stopFilePlayback();
+  };
+
+  $("btnPause").onclick = ()=>{
+    if(sourceMode === "SD") send({cmd:"pause"});
+    else pauseFilePlayback();
+  };
 
   seek.oninput = ()=> updateSeekLabel();
   seek.onchange = ()=>{
     const posMs = parseInt(seek.value,10) || 0;
-    send({cmd:"seek", posMs});
+    if(sourceMode === "SD"){
+      send({cmd:"seek", posMs});
+      return;
+    }
+    applyFileSeek(posMs);
   };
 
   vol.oninput = ()=>{
@@ -918,7 +1367,7 @@ static const char kHtml[] PROGMEM = R"HTML(
   };
 
   testChSelect.onchange = ()=>{
-    if(testToneActive){
+    if(testToneActive || fileStreamActive){
       testChSelect.value = String(testToneChannels);
       return;
     }
@@ -929,9 +1378,10 @@ static const char kHtml[] PROGMEM = R"HTML(
 
   updateTestChModeUi();
   updateTestWatermarks();
+  updateSourceModeUi();
 
   setInterval(()=>{
-    if(testToneActive) return;
+    if(testToneActive || fileStreamActive || sourceMode === "FILE") return;
     if(ws && ws.readyState === WebSocket.OPEN){
       send({cmd:"get_state"});
     }
@@ -1171,6 +1621,13 @@ static bool mount_sdmmc_4bit(uint32_t freq_hz) {
 
   g_mounted = true;
   return true;
+}
+
+static void unmount_sdmmc() {
+  if (g_mounted) {
+    SD_MMC.end();
+    g_mounted = false;
+  }
 }
 
 static void clearFileList() {
@@ -2040,6 +2497,78 @@ private:
 
 static UzuTdmPlayer g_player;
 
+static void mountAndScanSdCard(bool verbose) {
+  g_player.stop();
+  clearFileList();
+  g_selectedTrack0 = 0;
+  g_selectedLenMs = 0;
+
+  if (!isCardInserted()) {
+    unmount_sdmmc();
+    if (verbose) Serial.println("[SD] no card");
+    wsBroadcastState();
+    wsBroadcastTracks();
+    return;
+  }
+
+  if (mount_sdmmc_4bit(g_sd_freq_hz)) {
+    scanUzuFiles("/");
+    if (verbose) {
+      Serial.printf("[SD] mounted, %d file(s)\n", g_fileCount);
+    }
+  } else {
+    clearFileList();
+    if (verbose) Serial.println("[SD] mount failed");
+  }
+
+  wsBroadcastState();
+  wsBroadcastTracks();
+}
+
+static void processSdCardDetect() {
+  const uint32_t now = millis();
+
+  if ((now - g_sdCdLastPollMs) < SD_CD_POLL_MS) return;
+  g_sdCdLastPollMs = now;
+
+  const bool read = isCardInserted();
+  if (read != g_sdCdLastRead) {
+    g_sdCdLastRead = read;
+    g_sdCdStableSinceMs = now;
+    return;
+  }
+  if ((now - g_sdCdStableSinceMs) < SD_CD_DEBOUNCE_MS) return;
+
+  if (g_sdRemountPending && now >= g_sdRemountAtMs) {
+    g_sdRemountPending = false;
+    if (isCardInserted() && !g_mounted) {
+      Serial.println("[SD] card inserted");
+      mountAndScanSdCard(true);
+      g_sdCardPresent = true;
+    }
+    return;
+  }
+
+  if (read == g_sdCardPresent) return;
+
+  g_sdCardPresent = read;
+  if (!read) {
+    g_sdRemountPending = false;
+    Serial.println("[SD] card removed");
+    g_player.stop();
+    unmount_sdmmc();
+    clearFileList();
+    g_selectedTrack0 = 0;
+    g_selectedLenMs = 0;
+    wsBroadcastState();
+    wsBroadcastTracks();
+    return;
+  }
+
+  g_sdRemountPending = true;
+  g_sdRemountAtMs = now + SD_INSERT_SETTLE_MS;
+}
+
 // ====================================================
 // Web helpers
 // ====================================================
@@ -2119,6 +2648,22 @@ static void wsSendTracks(uint8_t clientId) {
   }
   s += "]}";
   ws.sendTXT(clientId, s);
+}
+
+static void wsBroadcastTracks() {
+  if (g_player.state() != PlayerState::PLAY && g_mounted) {
+    scanUzuFiles("/");
+  }
+
+  String s = "{\"type\":\"tracks\",\"items\":[";
+  for (int i = 0; i < g_fileCount; i++) {
+    if (i) s += ",";
+    s += "\"";
+    json_append_escaped(s, g_fileList[i].name);
+    s += "\"";
+  }
+  s += "]}";
+  ws.broadcastTXT(s);
 }
 
 static void wsSendTrackInfo(uint8_t clientId, int trackIndex0) {
@@ -3101,6 +3646,11 @@ static void performSystemInit(bool verbose) {
   g_streamDroppedBytes = 0;
   g_streamRxBytes = 0;
 
+  g_sdCardPresent = isCardInserted();
+  g_sdCdLastRead = g_sdCardPresent;
+  g_sdCdStableSinceMs = millis();
+  g_sdRemountPending = false;
+
   g_mounted = mount_sdmmc_4bit(g_sd_freq_hz);
   if (verbose) {
     Serial.println(g_mounted ? "Auto mount OK" : "Auto mount FAILED");
@@ -3188,6 +3738,8 @@ void loop() {
   }
 
   g_parser.process();
+
+  processSdCardDetect();
 
   dns.processNextRequest();
   ws.loop();
