@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 90
+#define BUILD_NUMBER 91
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -1507,7 +1507,7 @@ static void decodeMp3SlotWorker() {
   }
 
   mp3UpdatePlayWindow();
-  if (g_mp3_pcm_frame_count == 0) {
+  if (g_mp3_pcm_frame_count == 0U) {
     return;
   }
 
@@ -1548,6 +1548,10 @@ static void decodeMp3SlotWorker() {
     Serial.print(cachePeak);
     Serial.print(F(" outPeak="));
     Serial.println(outPeak);
+  }
+
+  if (g_mp3_pcm_frame_count == 0U) {
+    return;
   }
 
   for (uint32_t i = 0; i < UZC_MP3_PERIOD_STEREO_441; i++) {
@@ -2351,6 +2355,11 @@ static void setState(BtState s) {
   BtState old = (BtState)g_state;
   g_state = s;
   g_state_started_ms = millis();
+#if UZU_I2S_TEST_BYPASS_BT
+  if (s == ST_CONNECTING || s == ST_CONNECT) {
+    g_i2s_bench_playback = false;
+  }
+#endif
   DBG("STATE %s -> %s", stateName(old), stateName(s));
 }
 
