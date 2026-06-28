@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 89
+#define BUILD_NUMBER 90
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -479,9 +479,9 @@ static volatile BtState g_state = ST_IDLE;
 // ============================================================
 static portMUX_TYPE g_rb_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static constexpr uint32_t PCM_HOLD_FRAMES = 4096;
+static constexpr uint32_t PCM_HOLD_FRAMES = 2304;  // 2×1152 ステージング（ring が A2DP ジッタ吸収）
 // A2DP audio_cb は ~512frames/回のバースト → MP3 は 2 スロット分溜めてから開始
-static constexpr uint32_t PCM_PREBUFFER_FRAMES = 2304;  // 2 × 1152 @44.1kHz
+static constexpr uint32_t PCM_PREBUFFER_FRAMES = 1152;  // 1 × 1152 @44.1kHz
 static int16_t g_pcm_hold[PCM_HOLD_FRAMES * 2];
 static uint32_t g_pcm_hold_count = 0;
 static uint32_t g_pcm_hold_rd = 0;
@@ -568,9 +568,14 @@ static void pcmPlaybackBegin() {
 
 // I2S デコード → hold（小さめジッタ）→ ring → A2DP audio_cb
 static void servicePcmHoldToRing() {
-  if (!g_pcm_playback_active || g_i2s_bench_playback) {
+  if (!g_pcm_playback_active) {
     return;
   }
+#if UZU_I2S_TEST_BYPASS_BT
+  if (g_i2s_bench_playback) {
+    return;
+  }
+#endif
   if (g_state != ST_CONNECT || !g_audio_enable) {
     return;
   }
@@ -722,9 +727,7 @@ static void tryBeginPlaybackWhenReady(uint32_t holdUsed) {
     return;
   }
 #endif
-  if (g_audio_state != ESP_A2D_AUDIO_STATE_STARTED) {
-    return;
-  }
+  // startMedia() が A2DP ストリームを起動する（audio_state STARTED 待ちはデッドロック）
   pcmPlaybackBegin();
 }
 
@@ -3217,6 +3220,13 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
 
     // MEDIA START は PCM プリバッファ完了時 (pcmPlaybackBegin) に行う
     g_media_start_pending = false;
+    {
+      uint32_t holdUsed = 0;
+      portENTER_CRITICAL(&g_rb_mux);
+      holdUsed = pcmHoldUsedNolock();
+      portEXIT_CRITICAL(&g_rb_mux);
+      tryBeginPlaybackWhenReady(holdUsed);
+    }
     return;
   }
 
@@ -3317,26 +3327,29 @@ static void handleVeryLongPress() {
 
 #if UZU_I2S_TEST_BYPASS_BT
 static void pollSerialTestCommands() {
-  static String line;
+  static char line[32];
+  static uint8_t lineLen = 0;
   while (Serial.available() > 0) {
     const char c = (char)Serial.read();
     if (c == '\r') {
       continue;
     }
     if (c == '\n') {
-      line.trim();
-      if (line.equalsIgnoreCase(F("BT GO")) && g_state == ST_IDLE) {
-        Serial.println(F("OK BT GO"));
-        startConnectOrPairingFromIdle();
-      } else if (line.length() > 0) {
-        Serial.print(F("# unknown: "));
-        Serial.println(line);
+      line[lineLen] = '\0';
+      if (lineLen > 0) {
+        if (strcasecmp(line, "BT GO") == 0 && g_state == ST_IDLE) {
+          Serial.println(F("OK BT GO"));
+          startConnectOrPairingFromIdle();
+        } else {
+          Serial.print(F("# unknown: "));
+          Serial.println(line);
+        }
       }
-      line = "";
+      lineLen = 0;
       continue;
     }
-    if (line.length() < 32) {
-      line += c;
+    if (lineLen + 1U < sizeof(line)) {
+      line[lineLen++] = c;
     }
   }
 }
