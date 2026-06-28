@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 86
+#define BUILD_NUMBER 88
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -664,8 +664,12 @@ static void tryBeginPlaybackWhenReady(uint32_t holdUsed) {
     return;
   }
 #if UZU_I2S_TEST_BYPASS_BT
-  if (g_state != ST_CONNECT || !g_audio_enable) {
+  // ベンチは IDLE のみ。CONNECTING/PAIRING 中は PCM を hold に溜めて BT 接続後に再生する
+  if (g_state == ST_IDLE && !g_audio_enable) {
     i2sBenchBeginPlayback(holdUsed);
+    return;
+  }
+  if (g_state != ST_CONNECT || !g_audio_enable) {
     return;
   }
 #endif
@@ -3273,6 +3277,33 @@ static void handleVeryLongPress() {
   enterErase();
 }
 
+#if UZU_I2S_TEST_BYPASS_BT
+static void pollSerialTestCommands() {
+  static String line;
+  while (Serial.available() > 0) {
+    const char c = (char)Serial.read();
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      line.trim();
+      if (line.equalsIgnoreCase(F("BT GO")) && g_state == ST_IDLE) {
+        Serial.println(F("OK BT GO"));
+        startConnectOrPairingFromIdle();
+      } else if (line.length() > 0) {
+        Serial.print(F("# unknown: "));
+        Serial.println(line);
+      }
+      line = "";
+      continue;
+    }
+    if (line.length() < 32) {
+      line += c;
+    }
+  }
+}
+#endif
+
 static void pollButton() {
   static bool lastPressed = false;
   static uint32_t tDown = 0;
@@ -3397,6 +3428,7 @@ void loop() {
     serviceI2SInput();
   }
 #if UZU_I2S_TEST_BYPASS_BT
+  pollSerialTestCommands();
   i2sBenchDrainPcm();
 #endif
 #if UZU_ENABLE_I2C
