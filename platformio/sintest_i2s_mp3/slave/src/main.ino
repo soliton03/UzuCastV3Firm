@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 88
+#define BUILD_NUMBER 89
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -496,6 +496,7 @@ static bool g_pcm_input_armed = false;
 static uint32_t g_pcm_underrun_frames = 0;
 static uint32_t g_pcm_push_drop_frames = 0;
 static bool g_media_ctrl_started = false;
+static uint32_t g_pcm_service_drain_ms = 0;
 
 #if UZU_I2S_TEST_BYPASS_BT
 static bool g_i2s_bench_playback = false;
@@ -561,7 +562,55 @@ static void pcmPlaybackBegin() {
   g_pcm_playback_active = true;
   g_pcm_underrun_frames = 0;
   g_pcm_push_drop_frames = 0;
+  g_pcm_service_drain_ms = 0;
   tryStartMediaWhenBuffered();
+}
+
+// I2S デコード → hold（小さめジッタ）→ ring → A2DP audio_cb
+static void servicePcmHoldToRing() {
+  if (!g_pcm_playback_active || g_i2s_bench_playback) {
+    return;
+  }
+  if (g_state != ST_CONNECT || !g_audio_enable) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (g_pcm_service_drain_ms == 0) {
+    g_pcm_service_drain_ms = now;
+    return;
+  }
+  const uint32_t dt = now - g_pcm_service_drain_ms;
+  if (dt < 5U) {
+    return;
+  }
+  g_pcm_service_drain_ms = now;
+  uint32_t want = (44100UL * dt) / 1000UL;
+  if (want == 0U) {
+    want = 1U;
+  }
+
+  portENTER_CRITICAL(&g_rb_mux);
+  while (want > 0U && g_pcm_hold_rd < g_pcm_hold_count) {
+    const uint32_t w = g_rb_w;
+    const uint32_t r = g_rb_r;
+    const uint32_t used = rb_used_nolock(w, r);
+    const uint32_t freef = rb_free_nolock(used);
+    if (freef == 0U) {
+      break;
+    }
+    const uint32_t hidx = g_pcm_hold_rd * 2;
+    const uint32_t rbidx = (w % RB_FRAMES) * 2;
+    g_rb[rbidx + 0] = g_pcm_hold[hidx + 0];
+    g_rb[rbidx + 1] = g_pcm_hold[hidx + 1];
+    g_rb_w = w + 1U;
+    g_pcm_hold_rd++;
+    want--;
+  }
+  if (g_pcm_hold_rd >= g_pcm_hold_count) {
+    g_pcm_hold_count = 0;
+    g_pcm_hold_rd = 0;
+  }
+  portEXIT_CRITICAL(&g_rb_mux);
 }
 
 static bool pcmBufferReadyForPlayback(uint32_t holdUsed) {
@@ -686,6 +735,7 @@ static void pcmHoldReset() {
   portEXIT_CRITICAL(&g_rb_mux);
   g_pcm_playback_active = false;
   g_pcm_input_armed = false;
+  g_pcm_service_drain_ms = 0;
 #if UZU_I2S_TEST_BYPASS_BT
   g_i2s_bench_playback = false;
   g_i2s_bench_drain_ms = 0;
@@ -2174,18 +2224,6 @@ static int32_t audio_cb(Frame *frames, int32_t frame_count) {
   }
   g_rb_r = r;
   filled = rbPop;
-
-  while (filled < (uint32_t)frame_count && g_pcm_hold_rd < g_pcm_hold_count) {
-    const uint32_t idx = g_pcm_hold_rd * 2;
-    frames[filled].channel1 = g_pcm_hold[idx + 0];
-    frames[filled].channel2 = g_pcm_hold[idx + 1];
-    g_pcm_hold_rd++;
-    filled++;
-  }
-  if (g_pcm_hold_rd >= g_pcm_hold_count) {
-    g_pcm_hold_count = 0;
-    g_pcm_hold_rd = 0;
-  }
   portEXIT_CRITICAL(&g_rb_mux);
 
   if (filled < (uint32_t)frame_count) {
@@ -3429,7 +3467,15 @@ void loop() {
   }
 #if UZU_I2S_TEST_BYPASS_BT
   pollSerialTestCommands();
-  i2sBenchDrainPcm();
+  if (g_i2s_bench_playback) {
+    i2sBenchDrainPcm();
+  } else if (g_state == ST_CONNECT && g_audio_enable && g_pcm_playback_active) {
+    servicePcmHoldToRing();
+  }
+#else
+  if (g_state == ST_CONNECT && g_audio_enable && g_pcm_playback_active) {
+    servicePcmHoldToRing();
+  }
 #endif
 #if UZU_ENABLE_I2C
   i2cSlavePoll();
