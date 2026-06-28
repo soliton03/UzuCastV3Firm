@@ -34,6 +34,8 @@ def main() -> int:
     ap.add_argument("--master-port", default="COM11")
     ap.add_argument("--slave-port", default="COM7")
     ap.add_argument("--duration", type=float, default=35.0)
+    ap.add_argument("--bt-go", action="store_true")
+    ap.add_argument("--wait-before", type=float, default=1.0)
     args = ap.parse_args()
 
     slave_lines: list[str] = []
@@ -52,7 +54,13 @@ def main() -> int:
     t_slave.start()
     t_master.start()
 
-    time.sleep(1.0)
+    time.sleep(args.wait_before)
+    if args.bt_go:
+        slave_ser.write(b"BT GO\r\n")
+        slave_ser.flush()
+        print("[slave-cmd] BT GO")
+        time.sleep(3.0)
+
     for cmd in ("MODE MP3", "ON 1"):
         master_ser.write((cmd + "\r\n").encode())
         master_ser.flush()
@@ -79,6 +87,16 @@ def main() -> int:
     max_peak = max(peaks) if peaks else 0
     drops = [int(x) for x in re.findall(r"u/d=\d+/(\d+)", text)]
     max_drop = max(drops) if drops else 0
+    rbs = [int(m) for m in re.findall(r"rb=(\d+)", text)]
+    max_rb = max(rbs) if rbs else 0
+    connected = any(
+        s in text
+        for s in (
+            "STATE PAIRING -> CONNECT",
+            "STATE CONNECTING -> CONNECT",
+            "A2DP conn_state=2",
+        )
+    )
     play_on = any("play=1" in ln for ln in slave_lines if "I2S tag hb" in ln)
     hb = [ln for ln in slave_lines if "I2S tag hb" in ln][-3:]
 
@@ -108,8 +126,8 @@ def main() -> int:
         reasons.append(f"push_drop={max_drop}")
 
     summary = (
-        f"build={build.group(1) if build else '?'} media={int(media)} "
-        f"decode={decode} peak={max_peak} max_drop={max_drop} play={int(play_on)}"
+        f"build={build.group(1) if build else '?'} connected={connected} media={int(media)} "
+        f"decode={decode} peak={max_peak} rb_max={max_rb} max_drop={max_drop} play={int(play_on)}"
     )
     msg = ("PASS " if ok else "FAIL ") + summary
     if reasons:
