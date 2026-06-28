@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 91
+#define BUILD_NUMBER 92
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -599,9 +599,10 @@ static void servicePcmHoldToRing() {
     const uint32_t w = g_rb_w;
     const uint32_t r = g_rb_r;
     const uint32_t used = rb_used_nolock(w, r);
-    const uint32_t freef = rb_free_nolock(used);
+    uint32_t freef = rb_free_nolock(used);
     if (freef == 0U) {
-      break;
+      g_rb_r = r + 1U;
+      freef = 1U;
     }
     const uint32_t hidx = g_pcm_hold_rd * 2;
     const uint32_t rbidx = (w % RB_FRAMES) * 2;
@@ -790,8 +791,20 @@ static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
 
   uint32_t n = frameCount;
   if (g_pcm_hold_count + n > PCM_HOLD_FRAMES) {
-    g_pcm_push_drop_frames += frameCount - (PCM_HOLD_FRAMES - g_pcm_hold_count);
+    const uint32_t dropExtra = frameCount - (PCM_HOLD_FRAMES - g_pcm_hold_count);
+    g_pcm_push_drop_frames += dropExtra;
     n = PCM_HOLD_FRAMES - g_pcm_hold_count;
+  }
+  if (n == 0U && frameCount > 0U && g_pcm_hold_rd < g_pcm_hold_count) {
+    g_pcm_hold_rd++;
+    if (g_pcm_hold_rd >= g_pcm_hold_count) {
+      g_pcm_hold_count = 0;
+      g_pcm_hold_rd = 0;
+    }
+    n = (frameCount <= PCM_HOLD_FRAMES) ? frameCount : PCM_HOLD_FRAMES;
+    if (g_pcm_hold_count + n > PCM_HOLD_FRAMES) {
+      n = PCM_HOLD_FRAMES - g_pcm_hold_count;
+    }
   }
   for (uint32_t i = 0; i < n; i++) {
     const uint32_t idx = (g_pcm_hold_count + i) * 2;
