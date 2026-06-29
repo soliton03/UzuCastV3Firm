@@ -12,7 +12,7 @@
  */
 
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 43
+#define BUILD_NUMBER 44
 #endif
 
 #include <SPI.h>
@@ -84,6 +84,18 @@ struct WavInfo {
   uint32_t dataSize;
 };
 
+struct UzuPcmInfo {
+  uint32_t dataOffset;
+  uint32_t channelCount;
+  uint32_t sampleRate;
+  uint32_t bitsPerSample;
+  uint32_t totalSamples;
+};
+
+static const uint8_t UZU_PCM_MAGIC[8] = {'U', 'Z', 'U', 'C', 'P', 'W', '1', 0};
+static const uint32_t UZU_PCM_HEADER_SIZE = 32768;
+static const uint32_t UZU_PCM_PLAY_CHANNEL = 0;  // CH1 (0-based) for I2S mono RAW path
+
 struct UzcHeader {
   uint16_t version;
   uint16_t codecType;
@@ -108,6 +120,7 @@ enum PlayUzcRoute : uint8_t {
   PLAY_ROUTE_WAV = 0,
   PLAY_ROUTE_UZC_MASTER,
   PLAY_ROUTE_UZC_SLAVE,
+  PLAY_ROUTE_UZU_PCM,
 };
 
 static I2SClass g_i2s;
@@ -128,6 +141,7 @@ static TaskHandle_t g_playTask = nullptr;
 static char g_playPath[128] = "";
 static char g_playLabel[96] = "";
 static bool g_playIsUzc = false;
+static bool g_playIsUzuPcm = false;
 static PlayUzcRoute g_playUzcRoute = PLAY_ROUTE_WAV;
 static volatile uint32_t g_uzcFrameIndex = 0;
 static uint16_t g_uzc_tx_slot_size = 0;
@@ -416,7 +430,27 @@ static bool isUzcPath(const char* path) {
   if (ext == nullptr) {
     return false;
   }
-  return strcasecmp(ext, ".uzc") == 0 || strcasecmp(ext, ".uzu") == 0;
+  return strcasecmp(ext, ".uzc") == 0;
+}
+
+static bool isUzuPcmPath(const char* path) {
+  const char* ext = strrchr(path, '.');
+  if (ext == nullptr) {
+    return false;
+  }
+  return strcasecmp(ext, ".uzu") == 0;
+}
+
+static bool isUzuPcmMagic(File& f) {
+  uint8_t magic[8];
+  if (!f.seek(0)) {
+    return false;
+  }
+  if (f.read(magic, sizeof(magic)) != sizeof(magic)) {
+    return false;
+  }
+  f.seek(0);
+  return memcmp(magic, UZU_PCM_MAGIC, sizeof(UZU_PCM_MAGIC)) == 0;
 }
 
 static void printUzcCodecName(uint16_t codecType) {
@@ -694,7 +728,115 @@ static size_t uzcWordsPerSlot(uint16_t slotSize) {
   return ((size_t)slotSize + 1U) / 2U;
 }
 
+static bool readU32At(File& f, uint32_t offset, uint32_t& v) {
+  if (!f.seek(offset)) {
+    return false;
+  }
+  return readU32(f, v);
+}
+
+static bool parseUzuPcmHeader(File& f, UzuPcmInfo& info) {
+  memset(&info, 0, sizeof(info));
+  if (!isUzuPcmMagic(f)) {
+    return false;
+  }
+  if (!readU32At(f, 8, info.dataOffset) || !readU32At(f, 12, info.channelCount) ||
+      !readU32At(f, 16, info.sampleRate) || !readU32At(f, 20, info.bitsPerSample) ||
+      !readU32At(f, 24, info.totalSamples)) {
+    return false;
+  }
+  return true;
+}
+
+static void printUzuPcmHeaderInfo(File& f, uint64_t fileSize) {
+  UzuPcmInfo info;
+  if (!parseUzuPcmHeader(f, info)) {
+    Serial.println(F("error: invalid UZU PCM header"));
+    return;
+  }
+
+  const uint64_t payloadBytes = (uint64_t)info.totalSamples * info.channelCount * 2ULL;
+  const uint64_t expectedSize = (uint64_t)info.dataOffset + payloadBytes;
+
+  Serial.println(F("--- UZU PCM Header ---"));
+  Serial.println(F("Magic:              UZUCPW1"));
+  Serial.print(F("DataOffset:         "));
+  Serial.println(info.dataOffset);
+  Serial.print(F("ChannelCount:       "));
+  Serial.println(info.channelCount);
+  Serial.print(F("SampleRate:         "));
+  Serial.print(info.sampleRate);
+  Serial.println(F(" Hz"));
+  Serial.print(F("BitsPerSample:      "));
+  Serial.println(info.bitsPerSample);
+  Serial.print(F("TotalSamples:       "));
+  Serial.println(info.totalSamples);
+  Serial.print(F("PayloadBytes:       "));
+  Serial.println((unsigned long)payloadBytes);
+  Serial.print(F("ExpectedFileSize:   "));
+  Serial.println((unsigned long)expectedSize);
+  Serial.print(F("ActualFileSize:     "));
+  Serial.println((unsigned long)fileSize);
+  if (info.sampleRate > 0) {
+    Serial.print(F("DurationSec:        "));
+    Serial.println((double)info.totalSamples / (double)info.sampleRate, 3);
+  }
+  if (expectedSize > fileSize) {
+    Serial.println(F("warn: file shorter than header implies"));
+  } else if (expectedSize < fileSize) {
+    Serial.print(F("note: "));
+    Serial.print((unsigned long)(fileSize - expectedSize));
+    Serial.println(F(" trailing bytes after payload"));
+  }
+}
+
+static bool validateUzuPcmForPlay(File& f, UzuPcmInfo& info) {
+  if (!parseUzuPcmHeader(f, info)) {
+    Serial.println(F("error: invalid UZU PCM file"));
+    return false;
+  }
+  if (info.dataOffset < UZU_PCM_HEADER_SIZE) {
+    Serial.println(F("error: UZU data offset too small"));
+    return false;
+  }
+  if (info.bitsPerSample != 16) {
+    Serial.print(F("error: bits per sample "));
+    Serial.print(info.bitsPerSample);
+    Serial.println(F(" (require 16)"));
+    return false;
+  }
+  if (info.channelCount < 1 || info.channelCount > 8) {
+    Serial.println(F("error: channel count must be 1..8"));
+    return false;
+  }
+  if (UZU_PCM_PLAY_CHANNEL >= info.channelCount) {
+    Serial.println(F("error: play channel out of range"));
+    return false;
+  }
+  if (info.sampleRate != I2S_SAMPLE_RATE) {
+    Serial.print(F("error: sample rate "));
+    Serial.print(info.sampleRate);
+    Serial.println(F(" Hz (require 44100 Hz)"));
+    return false;
+  }
+  if (info.totalSamples == 0) {
+    Serial.println(F("error: no samples"));
+    return false;
+  }
+  const uint64_t needSize =
+      (uint64_t)info.dataOffset + (uint64_t)info.totalSamples * info.channelCount * 2ULL;
+  if (needSize > (uint64_t)f.size()) {
+    Serial.println(F("error: UZU PCM data truncated"));
+    return false;
+  }
+  return true;
+}
+
 static bool validateUzcForPlay(File& f, UzcHeader& hdr) {
+  if (isUzuPcmMagic(f)) {
+    Serial.println(F("error: PCM .UZU file (use play for RAW I2S)"));
+    return false;
+  }
   if (!parseUzcHeader(f, hdr)) {
     Serial.println(F("error: invalid UZC file"));
     return false;
@@ -755,6 +897,72 @@ static bool validateUzcForPlay(File& f, UzcHeader& hdr) {
     return false;
   }
   return true;
+}
+
+static bool playUzuPcmStream(File& f, const UzuPcmInfo& info) {
+  if (!setI2sTxRate(I2S_SAMPLE_RATE)) {
+    return false;
+  }
+
+  Serial.print(F("UZU PCM I2S RAW (R=AAAA) CH"));
+  Serial.print(UZU_PCM_PLAY_CHANNEL + 1);
+  Serial.print(F(" @ "));
+  Serial.print(info.sampleRate);
+  Serial.print(F(" Hz, "));
+  Serial.print(info.channelCount);
+  Serial.print(F("ch, samples="));
+  Serial.println(info.totalSamples);
+
+  f.seek(info.dataOffset);
+  uint8_t buf[PLAY_READ_BYTES];
+
+  while (!g_playStopReq) {
+    if (g_playPaused) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    const size_t avail = f.available();
+    if (avail == 0) {
+      return true;
+    }
+
+    size_t toRead = avail;
+    if (toRead > PLAY_READ_BYTES) {
+      toRead = PLAY_READ_BYTES;
+    }
+    const size_t frameBytes = (size_t)info.channelCount * 2U;
+    toRead -= (toRead % frameBytes);
+    if (toRead == 0) {
+      return true;
+    }
+
+    const size_t n = f.read(buf, toRead);
+    if (n == 0) {
+      return true;
+    }
+    const size_t gotFrames = n / frameBytes;
+    const size_t useBytes = gotFrames * frameBytes;
+    if (useBytes == 0) {
+      return true;
+    }
+
+    if (!setI2sTxRate(I2S_SAMPLE_RATE)) {
+      return false;
+    }
+
+    if (info.channelCount == 1) {
+      i2sWritePcm(buf, useBytes, 1);
+      continue;
+    }
+
+    static int16_t mono[PLAY_READ_BYTES / 2];
+    const int16_t* in = (const int16_t*)buf;
+    for (size_t i = 0; i < gotFrames; i++) {
+      mono[i] = in[i * info.channelCount + UZU_PCM_PLAY_CHANNEL];
+    }
+    i2sWritePcm((const uint8_t*)mono, gotFrames * 2U, 1);
+  }
+  return false;
 }
 
 static size_t bytesToInt16Words(const uint8_t* bytes, size_t nbytes, int16_t* out, size_t outCap) {
