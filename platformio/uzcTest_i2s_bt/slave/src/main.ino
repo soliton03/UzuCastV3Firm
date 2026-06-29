@@ -203,7 +203,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 63
+#define BUILD_NUMBER 64
 #endif
 
 #define VERSION_STRING  "uzcTest_i2s_bt Slave (from uzuCastSubMP3, Core 3.x)"
@@ -1856,7 +1856,7 @@ static uint8_t g_reconnect_try_count = 0;
 static uint32_t g_reconnect_started_ms = 0;
 
 static const uint32_t TIMEOUT_PAIRING_MS    = 30000;
-static const uint32_t TIMEOUT_CONNECTING_MS = 8000;
+static const uint32_t TIMEOUT_CONNECTING_MS = 15000;
 static const uint32_t TIMEOUT_ERROR_SHOW_MS = 3000;
 static const uint32_t LONG_PRESS_MS         = 3000;
 static const uint32_t VERY_LONG_PRESS_MS    = 8000;
@@ -1904,6 +1904,7 @@ static volatile uint32_t g_gap_last_stop_ms = 0;
 static volatile uint32_t g_gap_raw_events = 0;
 static uint32_t g_gap_round = 0;
 static bool g_connecting_to_known = false;
+static bool g_connecting_grace_used = false;
 static bool g_gap_require_lastmac = false;
 
 static const char* stateName(BtState s) {
@@ -2148,6 +2149,9 @@ static void enterTimeout() {
 static void startConnectToKnown(const esp_bd_addr_t mac) {
   stopGapDiscovery();
   g_gap_connect_request = false;
+  g_connecting_to_known = true;
+  g_connecting_grace_used = false;
+  g_media_start_pending = false;
   setDiscoverableConnectable(false);
   esp_bd_addr_t tmp = {0};
   memcpy(tmp, mac, 6);
@@ -2544,6 +2548,13 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
   DBG("A2DP conn_state=%d state=%s", (int)state, stateName((BtState)g_state));
 
   if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    if (g_state != ST_CONNECTING && g_state != ST_PAIRING) {
+      DBG("CONNECTED ignored in state=%s (stale/race)", stateName((BtState)g_state));
+      return;
+    }
+
+    stopGapDiscovery();
+    g_gap_connect_request = false;
     g_audio_enable = true;
     resetAudioPipeline(false);
     resetUzcSlotAssembler();
@@ -2563,6 +2574,7 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
     g_reconnect_started_ms = 0;
     g_gap_require_lastmac = false;
     g_connecting_to_known = false;
+    g_connecting_grace_used = false;
     setPairingSubState(PSS_SCAN);
     setDiscoverableConnectable(false);
     setState(ST_CONNECT);
@@ -2808,7 +2820,12 @@ void loop() {
 
   if (g_state == ST_CONNECTING) {
     if (millis() - g_state_started_ms >= TIMEOUT_CONNECTING_MS) {
-      if (g_reconnect_active) {
+      if (g_conn_state == ESP_A2D_CONNECTION_STATE_CONNECTING && !g_connecting_grace_used) {
+        g_connecting_grace_used = true;
+        g_state_started_ms = millis();
+        DBG("CONNECTING still in progress -> extend timeout %lu ms",
+            (unsigned long)TIMEOUT_CONNECTING_MS);
+      } else if (g_reconnect_active) {
         DBG("CONNECTING timeout in reconnect mode -> RECONNECT_WAIT");
         disconnectNow();
         startReconnectWait(false);
