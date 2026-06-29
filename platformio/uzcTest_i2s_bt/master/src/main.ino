@@ -1673,6 +1673,13 @@ static void playbackTask(void* /*param*/) {
       finished = playUzcStream(f, hdr);
       setI2sTxRate(I2S_SAMPLE_RATE);
     }
+  } else if (g_playIsUzuPcm) {
+    UzuPcmInfo info;
+    if (!validateUzuPcmForPlay(f, info)) {
+      f.close();
+      goto done;
+    }
+    finished = playUzuPcmStream(f, info);
   } else {
     WavInfo wav;
     if (!validateWavForPlay(f, wav)) {
@@ -1694,6 +1701,7 @@ done:
   g_playState = PLAY_STOPPED;
   g_playPaused = false;
   g_playIsUzc = false;
+  g_playIsUzuPcm = false;
   g_playUzcRoute = PLAY_ROUTE_WAV;
   g_uzcFrameIndex = 0;
   g_playPath[0] = '\0';
@@ -1713,21 +1721,32 @@ static bool startPlaybackRoute(const char* path, const char* label, PlayUzcRoute
 
   const bool isWav = isWavPath(path);
   const bool isUzc = isUzcPath(path);
-  if (!isWav && !isUzc) {
-    Serial.println(F("error: not a WAV or UZC file"));
+  const bool isUzu = isUzuPcmPath(path);
+  if (!isWav && !isUzc && !isUzu) {
+    Serial.println(F("error: not a WAV, UZC, or UZU file"));
     return false;
   }
 
-  if (route == PLAY_ROUTE_WAV) {
-    if (!isWav) {
-      Serial.println(F("error: play supports WAV only (UZC: use play/splay/mplay)"));
-      return false;
-    }
-  } else {
-    if (!isUzc) {
-      Serial.println(F("error: mplay/splay require UZC file"));
-      return false;
-    }
+  switch (route) {
+    case PLAY_ROUTE_WAV:
+      if (!isWav) {
+        Serial.println(F("error: play WAV requires .wav file"));
+        return false;
+      }
+      break;
+    case PLAY_ROUTE_UZU_PCM:
+      if (!isUzu) {
+        Serial.println(F("error: play UZU requires .uzu PCM file"));
+        return false;
+      }
+      break;
+    case PLAY_ROUTE_UZC_MASTER:
+    case PLAY_ROUTE_UZC_SLAVE:
+      if (!isUzc) {
+        Serial.println(F("error: mplay/splay require .uzc file"));
+        return false;
+      }
+      break;
   }
 
   fileAccessBegin();
@@ -1743,6 +1762,9 @@ static bool startPlaybackRoute(const char* path, const char* label, PlayUzcRoute
   if (isUzc) {
     UzcHeader hdr;
     ok = validateUzcForPlay(f, hdr);
+  } else if (isUzu) {
+    UzuPcmInfo info;
+    ok = validateUzuPcmForPlay(f, info);
   } else {
     WavInfo wav;
     ok = validateWavForPlay(f, wav);
@@ -1755,7 +1777,8 @@ static bool startPlaybackRoute(const char* path, const char* label, PlayUzcRoute
   }
 
   g_playIsUzc = isUzc;
-  g_playUzcRoute = isUzc ? route : PLAY_ROUTE_WAV;
+  g_playIsUzuPcm = isUzu;
+  g_playUzcRoute = route;
   g_uzcFrameIndex = 0;
   copyCatalogPath(g_playPath, sizeof(g_playPath), path);
   copyCatalogPath(g_playLabel, sizeof(g_playLabel), label);
@@ -1766,6 +1789,7 @@ static bool startPlaybackRoute(const char* path, const char* label, PlayUzcRoute
     g_playPath[0] = '\0';
     g_playLabel[0] = '\0';
     g_playIsUzc = false;
+    g_playIsUzuPcm = false;
     g_playUzcRoute = PLAY_ROUTE_WAV;
     return false;
   }
@@ -2114,7 +2138,7 @@ static void cmdHelp() {
   Serial.println(F("dir   - SDカードのファイル一覧 (番号付き)"));
   Serial.println(F("type  - ファイル表示 (type <番号>)"));
   Serial.println(F("stat  - 現在の演奏状態"));
-  Serial.println(F("play  - WAV演奏 / UZCはsplay相当 (play <番号>)"));
+  Serial.println(F("play  - WAV/.UZU(PCM RAW) / .UZCはsplay相当 (play <番号>)"));
   Serial.println(F("mplay - UZCをMainでMP3デコード→PCM (I2S R=AAAA)"));
   Serial.println(F("splay - UZCを圧縮I2S転送 (I2S Rタグ / Slaveデコード)"));
   Serial.println(F("stest - スロット送信+mplay参照 (stest <番号> [frameNo] [sec])"));
@@ -2274,10 +2298,12 @@ static void cmdInfo(const char* arg) {
 
   if (isUzcPath(path)) {
     printUzcHeaderInfo(f, fileSize);
+  } else if (isUzuPcmPath(path)) {
+    printUzuPcmHeaderInfo(f, fileSize);
   } else if (isWavPath(path)) {
     printWavHeaderInfo(f, fileSize);
   } else {
-    Serial.println(F("format: unknown (not WAV/UZC)"));
+    Serial.println(F("format: unknown (not WAV/UZC/UZU)"));
   }
 
   f.close();
@@ -2356,6 +2382,10 @@ static void cmdPlay(const char* arg) {
     return;
   }
 
+  if (isUzuPcmPath(path)) {
+    startPlaybackRoute(path, label, PLAY_ROUTE_UZU_PCM);
+    return;
+  }
   if (isUzcPath(path)) {
     startPlaybackRoute(path, label, PLAY_ROUTE_UZC_SLAVE);
     return;
@@ -2364,7 +2394,7 @@ static void cmdPlay(const char* arg) {
     startPlaybackRoute(path, label, PLAY_ROUTE_WAV);
     return;
   }
-  Serial.println(F("error: not a WAV or UZC file"));
+  Serial.println(F("error: not a WAV, UZC, or UZU file"));
 }
 
 static void cmdMplay(const char* arg) {
