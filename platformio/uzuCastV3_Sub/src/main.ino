@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 74
+#define BUILD_NUMBER 75
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -520,10 +520,28 @@ static uint32_t pcmHoldFreeFrames() {
   return holdFree;
 }
 
+static uint32_t pcmPipelineFreeFrames() {
+  return pcmHoldFreeFrames();
+}
+
+static void waitForPcmPipelineSpace(uint32_t needFrames) {
+  uint32_t spins = 0;
+  while (needFrames > 0 && g_state == ST_CONNECT) {
+    if (pcmPipelineFreeFrames() >= needFrames) {
+      return;
+    }
+    vTaskDelay(1);
+    if (++spins > 50U) {
+      return;
+    }
+  }
+}
+
 static void tryStartMediaWhenBuffered() {
   if (g_media_ctrl_started || g_state != ST_CONNECT) {
     return;
   }
+  g_media_ctrl_started = true;
   startMedia();
 }
 
@@ -542,14 +560,16 @@ static bool pcmReadyForMediaStart() {
   if (g_i2c_slave_output_mode == I2C_MODE_MP3) {
     return g_tag_stat_decode_ok > 0;
   }
+  return g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
+#else
+  if (g_tag_stat_decode_ok > 0) {
+    return true;
+  }
+  return g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
 #endif
-  return g_tag_stat_slots_rx > 0;
 }
 
 static void pcmPlaybackBegin() {
-  if (g_state != ST_CONNECT || !g_audio_enable) {
-    return;
-  }
   g_pcm_playback_active = true;
   g_pcm_underrun_frames = 0;
   g_pcm_push_drop_frames = 0;
@@ -1697,6 +1717,7 @@ static void i2sTagDispatchMp3Slot() {
     g_i2s_tag_data_words = 0;
     return;
   }
+  waitForPcmPipelineSpace(1152);
   decodeMp3SlotWorker();
   g_slot_fill = 0;
   g_i2s_tag_data_words = 0;
@@ -1877,26 +1898,18 @@ static int32_t audio_cb(Frame *frames, int32_t frame_count) {
 }
 
 static void startMedia() {
-  if (g_media_ctrl_started) {
-    return;
-  }
+  esp_err_t r = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
   uint32_t piped = 0;
   portENTER_CRITICAL(&g_rb_mux);
   piped = g_pcm_hold_used + rb_used_nolock(g_rb_w, g_rb_r);
   portEXIT_CRITICAL(&g_rb_mux);
-  if (piped < PCM_PREBUFFER_FRAMES || g_tag_stat_slots_rx == 0) {
-    DBG("MEDIA START skipped piped=%lu rx=%lu", (unsigned long)piped,
-        (unsigned long)g_tag_stat_slots_rx);
-    return;
-  }
-  g_media_ctrl_started = true;
-  esp_err_t r = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-  DBG("MEDIA START -> %d (input=%lu, bt_path=44100, negotiated=%lu, piped=%lu, rx=%lu)",
+  DBG("MEDIA START -> %d (input=%lu, bt_path=44100, negotiated=%lu, piped=%lu, rx=%lu decode=%lu)",
       (int)r,
       (unsigned long)g_i2s_input_rate,
       (unsigned long)g_a2dp_negotiated_rate,
       (unsigned long)piped,
-      (unsigned long)g_tag_stat_slots_rx);
+      (unsigned long)g_tag_stat_slots_rx,
+      (unsigned long)g_tag_stat_decode_ok);
 }
 
 // ============================================================
@@ -2931,8 +2944,6 @@ static void audio_state_callback(esp_a2d_audio_state_t state, void *ptr) {
   if (state == ESP_A2D_AUDIO_STATE_STARTED && g_state == ST_CONNECT && g_audio_enable) {
     if (!g_pcm_playback_active && pcmReadyForMediaStart()) {
       pcmPlaybackBegin();
-    } else if (!g_pcm_playback_active && g_pcm_input_armed) {
-      g_pcm_playback_active = true;
     }
   }
 }

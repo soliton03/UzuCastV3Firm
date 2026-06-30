@@ -24,6 +24,14 @@ static const int16_t I2S_TAG_SLOT_DATA = (int16_t)0xAA55;
 static const int16_t I2S_TAG_PAD       = (int16_t)0xFFFF;
 static const int16_t I2S_TAG_INVALID   = (int16_t)0x0000;
 static const size_t UZC_MP3_PERIOD_FRAMES = 1152;
+static constexpr uint32_t UZC_TDM_TASK_STACK = 16384;
+
+// playUzcStreamTdm uses ~31 KiB of buffers; keep off task stack (8192 was too small).
+static uint8_t s_uzcChFileBuf[7][UZC_MAX_SLOT_SIZE];
+static uint8_t s_uzcChTxBuf[7][UZC_MAX_SLOT_SIZE];
+static int16_t s_uzcChWords[7][UZC_MAX_STEREO_WORDS];
+static int16_t s_uzcTdmPad[UZC_TDM_PERIOD_MAX * TDM_NUM_CH];
+static int16_t s_uzcStopFooterPad[64 * TDM_NUM_CH];
 
 struct UzcHeader {
   uint16_t version;
@@ -259,13 +267,12 @@ static bool tdmWritePeriod(i2s_chan_handle_t tx, const int16_t* tdm, size_t peri
 }
 
 static void uzcTransmitStopFooterTdm(i2s_chan_handle_t tx) {
-  int16_t pad[64 * TDM_NUM_CH];
   for (size_t i = 0; i < 64; i++) {
-    for (uint32_t ch = 0; ch < 7; ch++) pad[i * TDM_NUM_CH + ch] = 0;
-    pad[i * TDM_NUM_CH + 7] = I2S_TAG_PAD;
+    for (uint32_t ch = 0; ch < 7; ch++) s_uzcStopFooterPad[i * TDM_NUM_CH + ch] = 0;
+    s_uzcStopFooterPad[i * TDM_NUM_CH + 7] = I2S_TAG_PAD;
   }
   size_t written = 0;
-  i2s_channel_write(tx, pad, sizeof(pad), &written, portMAX_DELAY);
+  i2s_channel_write(tx, s_uzcStopFooterPad, sizeof(s_uzcStopFooterPad), &written, portMAX_DELAY);
 }
 
 static const uint8_t kUzuPcmMagic[8] = {'U', 'Z', 'U', 'C', 'P', 'W', '1', 0};
@@ -332,7 +339,7 @@ bool UzcTdmPlayer::playPath(const char* path) {
   m_active = true;
   m_lastError = nullptr;
 
-  BaseType_t ok = xTaskCreatePinnedToCore(playbackTask, "uzcTdm", 8192, this, 5, &m_task, 1);
+  BaseType_t ok = xTaskCreatePinnedToCore(playbackTask, "uzcTdm", UZC_TDM_TASK_STACK, this, 5, &m_task, 1);
   if (ok != pdPASS) {
     m_active = false;
     m_lastError = "ERR TASK";
@@ -398,11 +405,7 @@ bool UzcTdmPlayer::playUzcStreamTdm(File& f, UzcTdmPlayer* self) {
   UzcHeader hdr;
   if (!parseUzcHeader(f, hdr)) return false;
 
-  uint8_t chFileBuf[7][UZC_MAX_SLOT_SIZE];
-  uint8_t chTxBuf[7][UZC_MAX_SLOT_SIZE];
-  int16_t chWords[7][UZC_MAX_STEREO_WORDS];
   size_t nWords[7] = {0};
-  int16_t tdmPad[UZC_TDM_PERIOD_MAX * TDM_NUM_CH];
 
   const uint16_t txSlotSize = uzcTransmitSlotSize(hdr);
   const size_t wordsPerSlot = uzcWordsPerSlot(txSlotSize);
@@ -416,8 +419,9 @@ bool UzcTdmPlayer::playUzcStreamTdm(File& f, UzcTdmPlayer* self) {
                 (unsigned)numCh, (unsigned)periodFrames, (unsigned)slotStereoFrames, (unsigned)txSlotSize);
 
   const int16_t* chWordPtrs[7];
-  for (int i = 0; i < 7; i++) chWordPtrs[i] = chWords[i];
+  for (int i = 0; i < 7; i++) chWordPtrs[i] = s_uzcChWords[i];
 
+  bool slotPrefetched = false;
   for (uint32_t frameNo = 0; frameNo < hdr.totalFrameCount; frameNo++) {
     if (self->m_stopReq) break;
     while (self->m_paused) {
@@ -426,25 +430,49 @@ bool UzcTdmPlayer::playUzcStreamTdm(File& f, UzcTdmPlayer* self) {
     }
     if (self->m_stopReq) break;
 
-    const uint32_t blockOff = hdr.headerSize + frameNo * hdr.blockSize;
-    if (!f.seek(blockOff, SeekSet)) break;
+    if (!slotPrefetched) {
+      const uint32_t blockOff = hdr.headerSize + frameNo * hdr.blockSize;
+      if (!f.seek(blockOff, SeekSet)) break;
 
-    for (uint16_t ch = 0; ch < numCh; ch++) {
-      if (!readUzcChannelSlotFull(f, hdr.slotSize, chFileBuf[ch])) return false;
-      if (!uzcPrepareSlotForTransmit(chFileBuf[ch], hdr.slotSize, hdr.maxFrameSize,
-                                     chTxBuf[ch], txSlotSize)) {
-        return false;
+      for (uint16_t ch = 0; ch < numCh; ch++) {
+        if (!readUzcChannelSlotFull(f, hdr.slotSize, s_uzcChFileBuf[ch])) return false;
+        if (!uzcPrepareSlotForTransmit(s_uzcChFileBuf[ch], hdr.slotSize, hdr.maxFrameSize,
+                                       s_uzcChTxBuf[ch], txSlotSize)) {
+          return false;
+        }
+        nWords[ch] = bytesToInt16Words(s_uzcChTxBuf[ch], txSlotSize, s_uzcChWords[ch], wordsPerSlot);
       }
-      nWords[ch] = bytesToInt16Words(chTxBuf[ch], txSlotSize, chWords[ch], wordsPerSlot);
+      for (uint16_t ch = numCh; ch < hdr.channelCount; ch++) {
+        if (!f.seek(f.position() + hdr.slotSize, SeekSet)) return false;
+      }
     }
-    for (uint16_t ch = numCh; ch < hdr.channelCount; ch++) {
-      if (!f.seek(f.position() + hdr.slotSize, SeekSet)) return false;
+    slotPrefetched = false;
+
+    fillMp3TdmPeriodTagged(chWordPtrs, nWords, numCh, s_uzcTdmPad, periodFrames, slotStereoFrames);
+    if (!tdmWritePeriod(self->m_tx, s_uzcTdmPad, periodFrames)) {
+      Serial.println("[UZC] TDM write failed");
+      return false;
     }
 
-    fillMp3TdmPeriodTagged(chWordPtrs, nWords, numCh, tdmPad, periodFrames, slotStereoFrames);
-    if (!tdmWritePeriod(self->m_tx, tdmPad, periodFrames)) return false;
+    if (frameNo + 1 < hdr.totalFrameCount) {
+      const uint32_t nextOff = hdr.headerSize + (frameNo + 1) * hdr.blockSize;
+      if (!f.seek(nextOff, SeekSet)) break;
+      for (uint16_t ch = 0; ch < numCh; ch++) {
+        if (!readUzcChannelSlotFull(f, hdr.slotSize, s_uzcChFileBuf[ch])) return false;
+        if (!uzcPrepareSlotForTransmit(s_uzcChFileBuf[ch], hdr.slotSize, hdr.maxFrameSize,
+                                       s_uzcChTxBuf[ch], txSlotSize)) {
+          return false;
+        }
+        nWords[ch] = bytesToInt16Words(s_uzcChTxBuf[ch], txSlotSize, s_uzcChWords[ch], wordsPerSlot);
+      }
+      for (uint16_t ch = numCh; ch < hdr.channelCount; ch++) {
+        if (!f.seek(f.position() + hdr.slotSize, SeekSet)) return false;
+      }
+      slotPrefetched = true;
+    }
   }
 
   uzcTransmitStopFooterTdm(self->m_tx);
+  Serial.println("[UZC] TDM MP3 playback finished");
   return true;
 }
