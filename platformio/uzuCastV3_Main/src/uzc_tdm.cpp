@@ -262,8 +262,13 @@ static void fillMp3TdmPeriodTagged(const int16_t* const chWords[7], const size_t
 static bool tdmWritePeriod(i2s_chan_handle_t tx, const int16_t* tdm, size_t periodFrames) {
   size_t bytesWritten = 0;
   const size_t bytes = periodFrames * TDM_NUM_CH * sizeof(int16_t);
-  return i2s_channel_write(tx, tdm, bytes, &bytesWritten, portMAX_DELAY) == ESP_OK &&
-         bytesWritten == bytes;
+  const esp_err_t err = i2s_channel_write(tx, tdm, bytes, &bytesWritten, portMAX_DELAY);
+  if (err != ESP_OK || bytesWritten != bytes) {
+    Serial.printf("[UZC] TDM write failed err=%d wrote=%u/%u\n",
+                  (int)err, (unsigned)bytesWritten, (unsigned)bytes);
+    return false;
+  }
+  return true;
 }
 
 static void uzcTransmitStopFooterTdm(i2s_chan_handle_t tx) {

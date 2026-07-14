@@ -35,7 +35,7 @@ Events Run On:    Core 1
 #endif
 
 #define VERSION_STRING   "UZU CAST Version 1.00"
-#define FIRMWARE_BUILD   10034
+#define FIRMWARE_BUILD   10036
 #define FIRMWARE_BUILD_STR_HELPER(x) #x
 #define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 
@@ -1864,12 +1864,11 @@ static void tdm_disable_output() {
   if (!g_tdm_enabled) return;
 
   esp_err_t err = i2s_channel_disable(g_tx_handle);
+  g_tdm_enabled = false;
   if (err != ESP_OK) {
     Serial.printf("i2s_channel_disable error: %d\n", err);
     return;
   }
-
-  g_tdm_enabled = false;
 }
 
 // ====================================================
@@ -2383,6 +2382,7 @@ private:
 static StreamEngine g_streamEngine;
 static uint32_t g_lastBinBufferInfoMs = 0;
 static TaskHandle_t g_streamTaskHandle = nullptr;
+static TaskHandle_t g_playerTaskHandle = nullptr;
 
 static void streamPlaybackTask(void* param) {
   (void)param;
@@ -2810,6 +2810,33 @@ static UzuTdmPlayer g_player;
 static UzcTdmPlayer g_uzcPlayer;
 static bool g_uzcPlaying = false;
 
+static void playerPlaybackTask(void* param) {
+  (void)param;
+  for (;;) {
+    if (g_deviceMode != DeviceMode::STREAM && !g_uzcPlaying && !g_i2sTestActive) {
+      if (g_player.state() == PlayerState::PLAY) {
+        g_player.process();
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(5));
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
+static void ensurePlayerPlaybackTask() {
+  if (g_playerTaskHandle) return;
+  xTaskCreatePinnedToCore(
+      playerPlaybackTask,
+      "playerAudio",
+      4096,
+      nullptr,
+      5,
+      &g_playerTaskHandle,
+      1);
+}
+
 static void stopAllPlayback() {
   i2sTestStop();
   g_uzcPlayer.stop();
@@ -2848,6 +2875,7 @@ static bool playTrackByIndex(int index) {
     if (!tdm_set_sample_rate(TDM_DEFAULT_SAMPLE_RATE)) {
       return false;
     }
+    g_tdm_enabled = false;
     if (!tdm_enable_output()) {
       return false;
     }
@@ -4190,6 +4218,7 @@ static void performSystemInit(bool verbose) {
   }
 
   ensureStreamPlaybackTask();
+  ensurePlayerPlaybackTask();
 }
 
 static void shutdownNetworkServices() {
@@ -4254,9 +4283,6 @@ void loop() {
   ws.loop();
   wsProcessNotifications();
 
-  if (g_deviceMode != DeviceMode::STREAM && !g_uzcPlaying && !g_i2sTestActive) {
-    g_player.process();
-  }
   if (g_uzcPlaying && !g_uzcPlayer.isActive()) {
     g_uzcPlaying = false;
     tdm_disable_output();

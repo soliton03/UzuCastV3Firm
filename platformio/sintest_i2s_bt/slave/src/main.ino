@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 87
+#define BUILD_NUMBER 73
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -220,7 +220,7 @@ static void DBG(const char* fmt, ...) {
 #define UZU_I2S_TEST_BYPASS_BT 0
 #endif
 
-#define VERSION_STRING  "UZU CAST Sub MP3 1.03 I2S-441-R-TAG"
+#define VERSION_STRING  "sintest_i2s_bt Stage2 I2S-441-R-TAG (from uzuCastV3_Sub build 73)"
 
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
@@ -474,50 +474,42 @@ static UzuBluetoothA2DPSource a2dp;
 static volatile BtState g_state = ST_IDLE;
 
 // ============================================================
-// I2S/MP3 入力ジッタ（hold のみ。A2DP audio_cb が hold から直接取得）
+// I2S/MP3 入力ジッタ（hold + ring。A2DP audio_cb が hold から直接取得）
 // ============================================================
 static portMUX_TYPE g_rb_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static constexpr uint32_t PCM_HOLD_FRAMES = 5888;  // ~133ms @44.1kHz (ring buf removed)
-static constexpr uint32_t PCM_PREBUFFER_FRAMES = 2304;  // 2 MP3 frames @44.1kHz
-static constexpr uint32_t PCM_I2S_BACKPRESSURE_FRAMES = 1152;
+static constexpr uint32_t PCM_HOLD_FRAMES = 2816;  // ~64ms @44.1kHz
+static constexpr uint32_t PCM_PREBUFFER_FRAMES = 1152;  // 1 MP3 frame @44.1kHz
+static constexpr uint32_t PCM_I2S_BACKPRESSURE_FRAMES = 512;
 static int16_t g_pcm_hold[PCM_HOLD_FRAMES * 2];
 static uint32_t g_pcm_hold_w = 0;
 static uint32_t g_pcm_hold_r = 0;
 static uint32_t g_pcm_hold_used = 0;
-static uint32_t g_pcm_hold_min = UINT32_MAX;
+
+static constexpr uint32_t RB_FRAMES = 3072;
+static int16_t g_rb[RB_FRAMES * 2];
+static volatile uint32_t g_rb_w = 0;
+static volatile uint32_t g_rb_r = 0;
 
 static bool g_pcm_playback_active = false;
 static bool g_pcm_input_armed = false;
 static uint32_t g_pcm_underrun_frames = 0;
 static uint32_t g_pcm_push_drop_frames = 0;
 static bool g_media_ctrl_started = false;
-static volatile uint32_t g_audio_cb_frames = 0;
-#if UZU_I2S_TEST_BYPASS_BT
-static constexpr uint32_t PCM_BENCH_RESERVE_FRAMES = 1152;
-static bool g_i2s_bench_playback = false;
-static uint32_t g_i2s_bench_drain_ms = 0;
-static int16_t g_i2s_bench_peak = 0;
-static uint32_t g_i2s_bench_pcm_out = 0;
-#endif
 
+static inline uint32_t rb_used_nolock(uint32_t w, uint32_t r) {
+  return (w >= r) ? (w - r) : (RB_FRAMES - (r - w));
+}
+
+static inline uint32_t rb_free_nolock(uint32_t used) {
+  return (RB_FRAMES - 1) - used;
+}
+
+static void pushPcmFramesToRing(const int16_t* stereoFrames, uint32_t frameCount);
 static void startMedia();
-static void startConnectOrPairingFromIdle();
-static void uzcClearDecodeNotifications();
-static const char* stateName(BtState s);
 
 static inline uint32_t pcmHoldUsedNolock() {
   return g_pcm_hold_used;
-}
-
-static inline void pcmHoldNoteMin(uint32_t used) {
-  if (used < g_pcm_hold_min) {
-    g_pcm_hold_min = used;
-  }
-}
-
-static inline uint32_t pcmHoldMinForLog() {
-  return (g_pcm_hold_min == UINT32_MAX) ? 0U : g_pcm_hold_min;
 }
 
 static uint32_t pcmHoldFreeFrames() {
@@ -528,40 +520,10 @@ static uint32_t pcmHoldFreeFrames() {
   return holdFree;
 }
 
-static uint32_t pcmPipelineFreeFrames() {
-  return pcmHoldFreeFrames();
-}
-
-static bool pcmPlaybackDraining() {
-#if UZU_I2S_TEST_BYPASS_BT
-  return g_i2s_bench_playback ||
-         (g_pcm_playback_active && g_state == ST_CONNECT && g_audio_enable);
-#else
-  return g_pcm_playback_active && g_state == ST_CONNECT && g_audio_enable;
-#endif
-}
-
-static void waitForPcmPipelineSpace(uint32_t needFrames) {
-  if (!pcmPlaybackDraining()) {
-    return;
-  }
-  uint32_t spins = 0;
-  while (needFrames > 0) {
-    if (pcmPipelineFreeFrames() >= needFrames) {
-      return;
-    }
-    vTaskDelay(1);
-    if (++spins > 2000U) {
-      return;
-    }
-  }
-}
-
 static void tryStartMediaWhenBuffered() {
   if (g_media_ctrl_started || g_state != ST_CONNECT) {
     return;
   }
-  g_media_ctrl_started = true;
   startMedia();
 }
 
@@ -571,7 +533,7 @@ static bool pcmReadyForMediaStart() {
   }
   uint32_t piped = 0;
   portENTER_CRITICAL(&g_rb_mux);
-  piped = g_pcm_hold_used;
+  piped = g_pcm_hold_used + rb_used_nolock(g_rb_w, g_rb_r);
   portEXIT_CRITICAL(&g_rb_mux);
   if (piped < PCM_PREBUFFER_FRAMES) {
     return false;
@@ -580,143 +542,17 @@ static bool pcmReadyForMediaStart() {
   if (g_i2c_slave_output_mode == I2C_MODE_MP3) {
     return g_tag_stat_decode_ok > 0;
   }
-  return g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
-#else
-  if (g_tag_stat_decode_ok > 0) {
-    return true;
-  }
-  return g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
 #endif
+  return g_tag_stat_slots_rx > 0;
 }
-
-#if UZU_I2S_TEST_BYPASS_BT
-static int16_t pcmHoldPeakAbs(uint32_t maxScan) {
-  int16_t peak = 0;
-  portENTER_CRITICAL(&g_rb_mux);
-  uint32_t n = pcmHoldUsedNolock();
-  if (n > maxScan) {
-    n = maxScan;
-  }
-  for (uint32_t i = 0; i < n; i++) {
-    const uint32_t slot = (g_pcm_hold_r + i) % PCM_HOLD_FRAMES;
-    const uint32_t idx = slot * 2;
-    const int16_t s = g_pcm_hold[idx + 0];
-    const int16_t a = (s < 0) ? (int16_t)(-s) : s;
-    if (a > peak) {
-      peak = a;
-    }
-  }
-  portEXIT_CRITICAL(&g_rb_mux);
-  return peak;
-}
-
-static void i2sBenchBeginPlayback(uint32_t holdUsed) {
-  if (g_i2s_bench_playback) {
-    return;
-  }
-  g_i2s_bench_playback = true;
-  g_pcm_playback_active = true;
-  g_pcm_underrun_frames = 0;
-  g_pcm_push_drop_frames = 0;
-  g_i2s_bench_peak = 0;
-  g_i2s_bench_pcm_out = 0;
-  g_i2s_bench_drain_ms = millis();
-  g_pcm_hold_min = holdUsed;
-  Serial.printf("[I2S-BENCH] play start hold=%lu decodeOk=%lu rx=%lu (BT not required)\n",
-                (unsigned long)holdUsed,
-                (unsigned long)g_tag_stat_decode_ok,
-                (unsigned long)g_tag_stat_slots_rx);
-}
-
-static void i2sBenchDrainPcm() {
-  if (!g_i2s_bench_playback || g_audio_enable) {
-    return;
-  }
-  const uint32_t now = millis();
-  if (g_i2s_bench_drain_ms == 0) {
-    g_i2s_bench_drain_ms = now;
-    return;
-  }
-  const uint32_t dt = now - g_i2s_bench_drain_ms;
-  if (dt < 5U) {
-    return;
-  }
-  g_i2s_bench_drain_ms = now;
-  uint32_t want = (44100UL * dt) / 1000UL;
-  if (want == 0U) {
-    want = 1U;
-  }
-  portENTER_CRITICAL(&g_rb_mux);
-  uint32_t drainable = 0;
-  if (g_pcm_hold_used > PCM_BENCH_RESERVE_FRAMES) {
-    drainable = g_pcm_hold_used - PCM_BENCH_RESERVE_FRAMES;
-  }
-  if (want > drainable) {
-    want = drainable;
-  }
-  while (want > 0U && g_pcm_hold_used > 0) {
-    const uint32_t slot = g_pcm_hold_r % PCM_HOLD_FRAMES;
-    const uint32_t idx = slot * 2;
-    const int16_t s = g_pcm_hold[idx + 0];
-    const int16_t a = (s < 0) ? (int16_t)(-s) : s;
-    if (a > g_i2s_bench_peak) {
-      g_i2s_bench_peak = a;
-    }
-    g_i2s_bench_pcm_out++;
-    g_pcm_hold_r++;
-    g_pcm_hold_used--;
-    want--;
-  }
-  pcmHoldNoteMin(g_pcm_hold_used);
-  portEXIT_CRITICAL(&g_rb_mux);
-}
-
-static void pollSerialTestCommands() {
-  static char line[32];
-  static uint8_t lineLen = 0;
-  while (Serial.available() > 0) {
-    const char c = (char)Serial.read();
-    if (c == '\r') {
-      continue;
-    }
-    if (c == '\n') {
-      line[lineLen] = '\0';
-      if (lineLen > 0) {
-        if (strcasecmp(line, "PIPE RST") == 0) {
-          resetAudioPipeline(true);
-          resetUzcSlotAssembler();
-          uzcClearDecodeNotifications();
-          g_audio_cb_frames = 0;
-          Serial.println(F("OK PIPE RST"));
-        } else if (strcasecmp(line, "BT GO") == 0) {
-          if (g_state == ST_IDLE) {
-            Serial.println(F("OK BT GO"));
-            startConnectOrPairingFromIdle();
-          } else if (g_state == ST_CONNECT) {
-            Serial.println(F("OK BT already CONNECT"));
-          } else {
-            Serial.printf("# BT GO blocked state=%s\n", stateName((BtState)g_state));
-          }
-        } else {
-          Serial.print(F("# unknown: "));
-          Serial.println(line);
-        }
-      }
-      lineLen = 0;
-      continue;
-    }
-    if (lineLen + 1U < sizeof(line)) {
-      line[lineLen++] = c;
-    }
-  }
-}
-#endif
 
 static void pcmPlaybackBegin() {
+  if (g_state != ST_CONNECT || !g_audio_enable) {
+    return;
+  }
   g_pcm_playback_active = true;
   g_pcm_underrun_frames = 0;
   g_pcm_push_drop_frames = 0;
-  g_pcm_hold_min = UINT32_MAX;
   tryStartMediaWhenBuffered();
 }
 
@@ -728,13 +564,6 @@ static void pcmHoldReset() {
   portEXIT_CRITICAL(&g_rb_mux);
   g_pcm_playback_active = false;
   g_pcm_input_armed = false;
-  g_pcm_hold_min = UINT32_MAX;
-#if UZU_I2S_TEST_BYPASS_BT
-  g_i2s_bench_playback = false;
-  g_i2s_bench_drain_ms = 0;
-  g_i2s_bench_peak = 0;
-  g_i2s_bench_pcm_out = 0;
-#endif
 }
 
 static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
@@ -742,17 +571,15 @@ static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
     return;
   }
 
-  if (pcmPlaybackDraining()) {
-    waitForPcmPipelineSpace(frameCount);
-  }
-
+  uint32_t holdUsed = 0;
   portENTER_CRITICAL(&g_rb_mux);
-  uint32_t holdFree =
+  const uint32_t holdFree =
       (g_pcm_hold_used < PCM_HOLD_FRAMES) ? (PCM_HOLD_FRAMES - g_pcm_hold_used) : 0U;
-
-  const uint32_t n = (frameCount <= holdFree) ? frameCount : holdFree;
+  uint32_t n = frameCount;
+  if (n > holdFree) {
+    n = holdFree;
+  }
   if (n == 0) {
-    g_pcm_push_drop_frames += frameCount;
     portEXIT_CRITICAL(&g_rb_mux);
     return;
   }
@@ -764,23 +591,9 @@ static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
   }
   g_pcm_hold_w += n;
   g_pcm_hold_used += n;
-  if (n < frameCount) {
-    g_pcm_push_drop_frames += frameCount - n;
-  }
-  portEXIT_CRITICAL(&g_rb_mux);
-
-  uint32_t holdUsed = 0;
-  portENTER_CRITICAL(&g_rb_mux);
   holdUsed = g_pcm_hold_used;
   portEXIT_CRITICAL(&g_rb_mux);
 
-#if UZU_I2S_TEST_BYPASS_BT
-  if (!g_pcm_playback_active && !g_i2s_bench_playback && holdUsed >= PCM_PREBUFFER_FRAMES &&
-      g_pcm_input_armed && g_tag_stat_decode_ok > 0 && g_state == ST_IDLE && !g_audio_enable) {
-    i2sBenchBeginPlayback(holdUsed);
-    return;
-  }
-#endif
   if (g_audio_enable && !g_pcm_playback_active && pcmReadyForMediaStart()) {
     pcmPlaybackBegin();
   }
@@ -790,6 +603,10 @@ static void resetAudioPipeline(bool clearRateWindow) {
   (void)clearRateWindow;
   g_media_ctrl_started = false;
   pcmHoldReset();
+  portENTER_CRITICAL(&g_rb_mux);
+  g_rb_w = 0;
+  g_rb_r = 0;
+  portEXIT_CRITICAL(&g_rb_mux);
 }
 
 // ----- UZC / MP3 slot over I2S (fixed-length slot from Master) -----
@@ -888,6 +705,34 @@ static void resetUzcSlotAssembler() {
   g_mp3dec_ready = false;
   memset(&g_mp3dec, 0, sizeof(g_mp3dec));
   pcmHoldReset();
+}
+
+static void pushPcmFramesToRing(const int16_t* stereoFrames, uint32_t frameCount) {
+  if (frameCount == 0) {
+    return;
+  }
+  if (!(g_state == ST_CONNECT || g_state == ST_CONNECTING || g_state == ST_PAIRING)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&g_rb_mux);
+  uint32_t w = g_rb_w;
+  uint32_t r = g_rb_r;
+  uint32_t used = rb_used_nolock(w, r);
+  uint32_t freef = rb_free_nolock(used);
+  uint32_t push = (frameCount <= freef) ? frameCount : freef;
+
+  for (uint32_t i = 0; i < push; i++) {
+    uint32_t idx = (w % RB_FRAMES) * 2;
+    g_rb[idx + 0] = stereoFrames[i * 2 + 0];
+    g_rb[idx + 1] = stereoFrames[i * 2 + 1];
+    w++;
+  }
+  g_rb_w = w;
+  portEXIT_CRITICAL(&g_rb_mux);
+  if (push < frameCount) {
+    g_pcm_push_drop_frames += frameCount - push;
+  }
 }
 
 static void appendSlotBytesFromStereo(const int16_t* stereo, uint32_t stereoFrameCount, bool useRight) {
@@ -1367,6 +1212,9 @@ static void uzcClearDecodeNotifications() {
 }
 
 static bool scheduleMp3SlotDecode() {
+  if (g_uzc_decode_task == nullptr || g_uzc_decode_busy) {
+    return false;
+  }
   if (g_slot_fmt == UZC_SLOT_FMT_V2_META && !uzcSlotMetaLooksValid(g_slot_buf)) {
     return false;
   }
@@ -1374,13 +1222,18 @@ static bool scheduleMp3SlotDecode() {
     return false;
   }
   memcpy(g_decode_slot, g_slot_buf, g_slot_size);
-  decodeMp3SlotWorker();
+  g_uzc_decode_busy = true;
+  xTaskNotifyGive(g_uzc_decode_task);
   return true;
 }
 
 static bool scheduleMp3SlotDecodeLocked() {
+  if (g_uzc_decode_task == nullptr || g_uzc_decode_busy) {
+    return false;
+  }
   memcpy(g_decode_slot, g_slot_buf, g_slot_size);
-  decodeMp3SlotWorker();
+  g_uzc_decode_busy = true;
+  xTaskNotifyGive(g_uzc_decode_task);
   return true;
 }
 
@@ -1743,10 +1596,6 @@ static uint16_t i2sTagExpectedSlotWords() {
 }
 
 static void i2sTagBeginPadSkip(uint16_t dataWords) {
-  const uint16_t expWords = i2sTagExpectedSlotWords();
-  if (expWords != 0 && dataWords != expWords) {
-    dataWords = expWords;
-  }
   const uint32_t tagged = (uint32_t)dataWords + 2U;
   if (UZC_MP3_PERIOD_STEREO_441 > tagged) {
     g_i2s_tag_pad_skip = UZC_MP3_PERIOD_STEREO_441 - tagged;
@@ -1883,8 +1732,6 @@ static void i2sTagProcessStereoFrames(const int16_t* stereo, uint32_t stereoFram
         g_i2s_tag_pad_skip = 0;
         g_slot_fill = 0;
         g_slot_fmt = UZC_SLOT_FMT_V2_META;
-        g_slot_max_frame = 0;
-        g_slot_size_learned = false;
         break;
       case 0xAA55:
         if (g_i2s_tag_mp3_open) {
@@ -1917,27 +1764,19 @@ static void i2sTagProcessStereoFrames(const int16_t* stereo, uint32_t stereoFram
     const uint32_t pct = (g_tag_stat_slots_rx > 0)
                              ? (uint32_t)((err * 100UL) / g_tag_stat_slots_rx)
                              : 0U;
+    uint32_t rbUsed = 0;
     uint32_t holdUsed = 0;
     portENTER_CRITICAL(&g_rb_mux);
+    rbUsed = rb_used_nolock(g_rb_w, g_rb_r);
     holdUsed = g_pcm_hold_used;
     portEXIT_CRITICAL(&g_rb_mux);
-    const uint32_t holdMin = pcmHoldMinForLog();
-    DBG("I2S tag hb rate=%lu rx=%lu ok=%lu err=%lu (%lu%%) hold=%lu hmin=%lu u/d=%lu/%lu peek L=%d R=%04X armed=%d",
+    DBG("I2S tag hb rate=%lu rx=%lu ok=%lu err=%lu (%lu%%) hold=%lu rb=%lu u/d=%lu/%lu peek L=%d R=%04X armed=%d",
         (unsigned long)g_i2s_input_rate,
         (unsigned long)g_tag_stat_slots_rx, (unsigned long)g_tag_stat_decode_ok,
         (unsigned long)err, (unsigned long)pct,
-        (unsigned long)holdUsed, (unsigned long)holdMin,
+        (unsigned long)holdUsed, (unsigned long)rbUsed,
         (unsigned long)g_pcm_underrun_frames, (unsigned long)g_pcm_push_drop_frames,
         (int)g_i2s_dbg_last_l, (unsigned)g_i2s_dbg_last_r, (int)g_pcm_input_armed);
-#if UZU_I2S_TEST_BYPASS_BT
-    if (g_i2s_bench_playback) {
-      Serial.printf("[I2S-BENCH] pcm_out=%lu peak=%d hold=%lu hmin=%lu u/d=%lu/%lu\n",
-                    (unsigned long)g_i2s_bench_pcm_out, (int)g_i2s_bench_peak,
-                    (unsigned long)holdUsed, (unsigned long)holdMin,
-                    (unsigned long)g_pcm_underrun_frames,
-                    (unsigned long)g_pcm_push_drop_frames);
-    }
-#endif
   }
 #endif
 }
@@ -1955,7 +1794,7 @@ static void serviceI2SInput() {
     return;
   }
 
-  for (int burst = 0; burst < 128; burst++) {
+  for (int burst = 0; burst < 32; burst++) {
     if (pcmHoldFreeFrames() < PCM_I2S_BACKPRESSURE_FRAMES) {
       break;
     }
@@ -1996,34 +1835,30 @@ static int32_t audio_cb(Frame *frames, int32_t frame_count) {
   }
 
   uint32_t filled = 0;
-  static constexpr uint32_t kAudioCbBatchFrames = 64;
-
-  while (filled < (uint32_t)frame_count) {
-    uint32_t batch = 0;
-    portENTER_CRITICAL(&g_rb_mux);
-    if (g_pcm_hold_used > 0) {
-      const uint32_t want = (uint32_t)frame_count - filled;
-      batch = (want < kAudioCbBatchFrames) ? want : kAudioCbBatchFrames;
-      if (batch > g_pcm_hold_used) {
-        batch = g_pcm_hold_used;
-      }
-      for (uint32_t i = 0; i < batch; i++) {
-        const uint32_t slot = (g_pcm_hold_r + i) % PCM_HOLD_FRAMES;
-        const uint32_t idx = slot * 2;
-        frames[filled + i].channel1 = g_pcm_hold[idx + 0];
-        frames[filled + i].channel2 = g_pcm_hold[idx + 1];
-      }
-      g_pcm_hold_r += batch;
-      g_pcm_hold_used -= batch;
-      pcmHoldNoteMin(g_pcm_hold_used);
-    }
-    portEXIT_CRITICAL(&g_rb_mux);
-    if (batch == 0) {
-      break;
-    }
-    filled += batch;
+  portENTER_CRITICAL(&g_rb_mux);
+  uint32_t w = g_rb_w;
+  uint32_t r = g_rb_r;
+  uint32_t rbAvail = rb_used_nolock(w, r);
+  uint32_t rbPop = ((uint32_t)frame_count <= rbAvail) ? (uint32_t)frame_count : rbAvail;
+  for (uint32_t i = 0; i < rbPop; i++) {
+    uint32_t idx = (r % RB_FRAMES) * 2;
+    frames[i].channel1 = g_rb[idx + 0];
+    frames[i].channel2 = g_rb[idx + 1];
+    r++;
   }
-  g_audio_cb_frames += filled;
+  g_rb_r = r;
+  filled = rbPop;
+
+  while (filled < (uint32_t)frame_count && g_pcm_hold_used > 0) {
+    const uint32_t slot = g_pcm_hold_r % PCM_HOLD_FRAMES;
+    const uint32_t idx = slot * 2;
+    frames[filled].channel1 = g_pcm_hold[idx + 0];
+    frames[filled].channel2 = g_pcm_hold[idx + 1];
+    g_pcm_hold_r++;
+    g_pcm_hold_used--;
+    filled++;
+  }
+  portEXIT_CRITICAL(&g_rb_mux);
 
   if (filled < (uint32_t)frame_count) {
     g_pcm_underrun_frames += (uint32_t)frame_count - filled;
@@ -2036,18 +1871,26 @@ static int32_t audio_cb(Frame *frames, int32_t frame_count) {
 }
 
 static void startMedia() {
-  esp_err_t r = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+  if (g_media_ctrl_started) {
+    return;
+  }
   uint32_t piped = 0;
   portENTER_CRITICAL(&g_rb_mux);
-  piped = g_pcm_hold_used;
+  piped = g_pcm_hold_used + rb_used_nolock(g_rb_w, g_rb_r);
   portEXIT_CRITICAL(&g_rb_mux);
-  DBG("MEDIA START -> %d (input=%lu, bt_path=44100, negotiated=%lu, piped=%lu, rx=%lu decode=%lu)",
+  if (piped < PCM_PREBUFFER_FRAMES || g_tag_stat_slots_rx == 0) {
+    DBG("MEDIA START skipped piped=%lu rx=%lu", (unsigned long)piped,
+        (unsigned long)g_tag_stat_slots_rx);
+    return;
+  }
+  g_media_ctrl_started = true;
+  esp_err_t r = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+  DBG("MEDIA START -> %d (input=%lu, bt_path=44100, negotiated=%lu, piped=%lu, rx=%lu)",
       (int)r,
       (unsigned long)g_i2s_input_rate,
       (unsigned long)g_a2dp_negotiated_rate,
       (unsigned long)piped,
-      (unsigned long)g_tag_stat_slots_rx,
-      (unsigned long)g_tag_stat_decode_ok);
+      (unsigned long)g_tag_stat_slots_rx);
 }
 
 // ============================================================
@@ -2067,7 +1910,7 @@ static uint8_t g_reconnect_try_count = 0;
 static uint32_t g_reconnect_started_ms = 0;
 
 static const uint32_t TIMEOUT_PAIRING_MS    = 30000;
-static const uint32_t TIMEOUT_CONNECTING_MS = 15000;
+static const uint32_t TIMEOUT_CONNECTING_MS = 8000;
 static const uint32_t TIMEOUT_ERROR_SHOW_MS = 3000;
 static const uint32_t LONG_PRESS_MS         = 3000;
 static const uint32_t VERY_LONG_PRESS_MS    = 8000;
@@ -2115,7 +1958,6 @@ static volatile uint32_t g_gap_last_stop_ms = 0;
 static volatile uint32_t g_gap_raw_events = 0;
 static uint32_t g_gap_round = 0;
 static bool g_connecting_to_known = false;
-static bool g_connecting_grace_used = false;
 static bool g_gap_require_lastmac = false;
 
 static const char* stateName(BtState s) {
@@ -2384,14 +2226,13 @@ uint8_t i2cPortGetStatus() {
   if (g_has_pending && g_i2c_bt_pending) {
     st |= I2C_STATUS_BT_CONNECT_PENDING;
   }
-  uint32_t holdUsed = 0;
+  uint32_t rbUsed = 0;
   portENTER_CRITICAL(&g_rb_mux);
-  if (g_pcm_hold_used > 0) {
+  rbUsed = rb_used_nolock(g_rb_w, g_rb_r);
+  portEXIT_CRITICAL(&g_rb_mux);
+  if (rbUsed > 0) {
     st |= I2C_STATUS_BUFFER_ACTIVE;
   }
-  holdUsed = g_pcm_hold_used;
-  portEXIT_CRITICAL(&g_rb_mux);
-  (void)holdUsed;
   if (g_state == ST_ERROR || g_state == ST_TIMEOUT) {
     st |= I2C_STATUS_ERROR;
   }
@@ -2451,7 +2292,10 @@ uint8_t i2cPortClearBuffer(uint8_t bufferType) {
       resetUzcSlotAssembler();
       break;
     case 0x01:
-      pcmHoldReset();
+      portENTER_CRITICAL(&g_rb_mux);
+      g_rb_w = 0;
+      g_rb_r = 0;
+      portEXIT_CRITICAL(&g_rb_mux);
       break;
     case 0x02:
       resetUzcSlotAssembler();
@@ -2558,7 +2402,6 @@ static void startConnectToKnown(const esp_bd_addr_t mac) {
   stopGapDiscovery();
   g_gap_connect_request = false;
   g_connecting_to_known = true;
-  g_connecting_grace_used = false;
   g_media_start_pending = false;
   setDiscoverableConnectable(false);
   g_audio_enable = false;
@@ -2987,21 +2830,12 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
   DBG("A2DP conn_state=%d state=%s", (int)state, stateName((BtState)g_state));
 
   if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-    if (g_state != ST_CONNECTING && g_state != ST_PAIRING) {
-      DBG("CONNECTED ignored in state=%s (stale/race)", stateName((BtState)g_state));
-      return;
-    }
-
     stopGapDiscovery();
     g_gap_connect_request = false;
     g_audio_enable = true;
     resetAudioPipeline(false);
     resetUzcSlotAssembler();
     uzcClearDecodeNotifications();
-#if UZU_I2S_TEST_BYPASS_BT
-    g_i2s_bench_playback = false;
-#endif
-    g_audio_cb_frames = 0;
     drainI2sRx();
 
     if (g_state == ST_PAIRING && g_has_pending) {
@@ -3023,7 +2857,6 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
     g_reconnect_started_ms = 0;
     g_gap_require_lastmac = false;
     g_connecting_to_known = false;
-    g_connecting_grace_used = false;
     setPairingSubState(PSS_SCAN);
     setDiscoverableConnectable(false);
     setState(ST_CONNECT);
@@ -3084,6 +2917,8 @@ static void audio_state_callback(esp_a2d_audio_state_t state, void *ptr) {
   if (state == ESP_A2D_AUDIO_STATE_STARTED && g_state == ST_CONNECT && g_audio_enable) {
     if (!g_pcm_playback_active && pcmReadyForMediaStart()) {
       pcmPlaybackBegin();
+    } else if (!g_pcm_playback_active && g_pcm_input_armed) {
+      g_pcm_playback_active = true;
     }
   }
 }
@@ -3168,8 +3003,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println(F("=== uzuCastSubMP3 start ==="));
-  Serial.print(F("uzuCastSubMP3 ready  build "));
+  Serial.println(F("=== sintest_i2s_bt Slave start ==="));
+  Serial.print(F("sintest_i2s_bt Slave ready  build "));
   Serial.println(BUILD_NUMBER);
   Serial.println(VERSION_STRING);
 #if UZU_I2S_TEST_BYPASS_BT
@@ -3196,6 +3031,11 @@ void setup() {
 
   if (!i2s_rx_init_slave_stereo_16()) {
     enterError("I2S init failed");
+  }
+
+  if (xTaskCreate(uzcDecodeTask, "uzcMp3", 8192, nullptr, 3, &g_uzc_decode_task) != pdPASS) {
+    DBG("UZC decode task create failed");
+    g_uzc_decode_task = nullptr;
   }
 
   resetAudioPipeline(true);
@@ -3234,35 +3074,9 @@ void setup() {
 
 void loop() {
   serviceI2SInput();
-#if UZU_I2S_TEST_BYPASS_BT
-  pollSerialTestCommands();
-  if (g_i2s_bench_playback) {
-    i2sBenchDrainPcm();
-  }
-#endif
 #if UZU_ENABLE_I2C
   i2cSlavePoll();
 #endif
-
-  if (g_pcm_playback_active) {
-    static uint32_t s_pcmHbMs = 0;
-    const uint32_t nowHb = millis();
-    if ((uint32_t)(nowHb - s_pcmHbMs) >= 5000U) {
-      s_pcmHbMs = nowHb;
-      uint32_t holdUsed = 0;
-      portENTER_CRITICAL(&g_rb_mux);
-      holdUsed = g_pcm_hold_used;
-      portEXIT_CRITICAL(&g_rb_mux);
-      const uint32_t holdMin = pcmHoldMinForLog();
-      Serial.printf("[PCM] hold=%lu hmin=%lu cbout=%lu underrun=%lu drop=%lu\n",
-                    (unsigned long)holdUsed, (unsigned long)holdMin,
-                    (unsigned long)g_audio_cb_frames,
-                    (unsigned long)g_pcm_underrun_frames,
-                    (unsigned long)g_pcm_push_drop_frames);
-      g_pcm_hold_min = UINT32_MAX;
-      g_audio_cb_frames = 0;
-    }
-  }
 
   pollButton();
   updateLed();
@@ -3318,12 +3132,7 @@ void loop() {
 
   if (g_state == ST_CONNECTING) {
     if (millis() - g_state_started_ms >= TIMEOUT_CONNECTING_MS) {
-      if (g_conn_state == ESP_A2D_CONNECTION_STATE_CONNECTING && !g_connecting_grace_used) {
-        g_connecting_grace_used = true;
-        g_state_started_ms = millis();
-        DBG("CONNECTING still in progress -> extend timeout %lu ms",
-            (unsigned long)TIMEOUT_CONNECTING_MS);
-      } else if (g_reconnect_active) {
+      if (g_reconnect_active) {
         DBG("CONNECTING timeout in reconnect mode -> RECONNECT_WAIT");
         disconnectNow();
         startReconnectWait(false);

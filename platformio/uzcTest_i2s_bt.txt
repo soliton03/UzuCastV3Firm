@@ -1,0 +1,2 @@
+Master ESP32 - I2S - Slave ESP32 - Bluetooth
+これでMP3モードの再生が可能。UZUファイルもOKです。
