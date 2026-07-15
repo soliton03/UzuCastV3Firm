@@ -35,7 +35,7 @@ Events Run On:    Core 1
 #endif
 
 #define VERSION_STRING   "UZU CAST Version 1.00"
-#define FIRMWARE_BUILD   10036
+#define FIRMWARE_BUILD   10037
 #define FIRMWARE_BUILD_STR_HELPER(x) #x
 #define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 
@@ -2977,6 +2977,24 @@ static void processSdCardDetect() {
 // ====================================================
 // Web helpers
 // ====================================================
+static bool webSdPlaybackBusy() {
+  return g_uzcPlaying || g_player.state() != PlayerState::STOP;
+}
+
+static const char* webSdPlayStateString() {
+  if (g_uzcPlaying) {
+    if (!g_uzcPlayer.isActive()) {
+      return "STOP";
+    }
+    return g_uzcPlayer.isPaused() ? "PAUSE" : "PLAY";
+  }
+  switch (g_player.state()) {
+    case PlayerState::PLAY:  return "PLAY";
+    case PlayerState::PAUSE: return "PAUSE";
+    default:                 return "STOP";
+  }
+}
+
 static void json_append_escaped(String& s, const char* p) {
   if (!p) return;
   while (*p) {
@@ -3059,7 +3077,7 @@ static bool read_uzu_track_info(const char* path, WebTrackInfo& info) {
 }
 
 static void wsSendTracks(uint8_t clientId) {
-  if (g_player.state() != PlayerState::PLAY) {
+  if (!webSdPlaybackBusy()) {
     scanUzuFiles("/");
   }
 
@@ -3075,7 +3093,7 @@ static void wsSendTracks(uint8_t clientId) {
 }
 
 static void wsBroadcastTracks() {
-  if (g_player.state() != PlayerState::PLAY && g_mounted) {
+  if (!webSdPlaybackBusy() && g_mounted) {
     scanUzuFiles("/");
   }
 
@@ -3091,7 +3109,7 @@ static void wsBroadcastTracks() {
 }
 
 static void wsSendTrackInfo(uint8_t clientId, int trackIndex0) {
-  if (g_player.state() != PlayerState::PLAY) {
+  if (!webSdPlaybackBusy()) {
     scanUzuFiles("/");
   }
 
@@ -3146,21 +3164,17 @@ static void wsSendTrackInfo(uint8_t clientId, int trackIndex0) {
 }
 
 static void wsSendState(uint8_t clientId) {
-  uint32_t lenMs = (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE)
-                 ? g_player.lengthMs()
-                 : g_selectedLenMs;
-
-  uint32_t posMs = (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE)
-                 ? g_player.positionMs()
-                 : 0;
+  uint32_t lenMs = g_selectedLenMs;
+  uint32_t posMs = 0;
+  if (g_uzcPlaying && g_uzcPlayer.isActive()) {
+    lenMs = g_selectedLenMs;
+  } else if (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE) {
+    lenMs = g_player.lengthMs();
+    posMs = g_player.positionMs();
+  }
 
   String st = "{\"type\":\"state\",\"play\":\"";
-  switch (g_player.state()) {
-    case PlayerState::PLAY:  st += "PLAY"; break;
-    case PlayerState::PAUSE: st += "PAUSE"; break;
-    case PlayerState::STOP:  st += "STOP"; break;
-    default:                 st += "ERROR"; break;
-  }
+  st += webSdPlayStateString();
   st += "\",\"trackIndex\":";
   st += g_selectedTrack0;
   st += ",\"posMs\":";
@@ -3174,21 +3188,17 @@ static void wsSendState(uint8_t clientId) {
 }
 
 static void wsBroadcastState() {
-  uint32_t lenMs = (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE)
-                 ? g_player.lengthMs()
-                 : g_selectedLenMs;
-
-  uint32_t posMs = (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE)
-                 ? g_player.positionMs()
-                 : 0;
+  uint32_t lenMs = g_selectedLenMs;
+  uint32_t posMs = 0;
+  if (g_uzcPlaying && g_uzcPlayer.isActive()) {
+    lenMs = g_selectedLenMs;
+  } else if (g_player.state() == PlayerState::PLAY || g_player.state() == PlayerState::PAUSE) {
+    lenMs = g_player.lengthMs();
+    posMs = g_player.positionMs();
+  }
 
   String st = "{\"type\":\"state\",\"play\":\"";
-  switch (g_player.state()) {
-    case PlayerState::PLAY:  st += "PLAY"; break;
-    case PlayerState::PAUSE: st += "PAUSE"; break;
-    case PlayerState::STOP:  st += "STOP"; break;
-    default:                 st += "ERROR"; break;
-  }
+  st += webSdPlayStateString();
   st += "\",\"trackIndex\":";
   st += g_selectedTrack0;
   st += ",\"posMs\":";
@@ -3449,7 +3459,13 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 
       if (msg.indexOf("\"cmd\":\"play\"") >= 0) {
         if (g_deviceMode != DeviceMode::STREAM && g_fileCount > 0) {
-          playTrackByIndex(g_selectedTrack0 + 1);
+          if (g_uzcPlaying && g_uzcPlayer.isPaused()) {
+            g_uzcPlayer.resume();
+          } else if (g_player.state() == PlayerState::PAUSE) {
+            g_player.resume();
+          } else {
+            playTrackByIndex(g_selectedTrack0 + 1);
+          }
         }
       }
       else if (msg.indexOf("\"cmd\":\"stop\"") >= 0) {
@@ -3463,7 +3479,7 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
         }
       }
       else if (msg.indexOf("\"cmd\":\"select\"") >= 0) {
-        if (g_player.state() == PlayerState::STOP) {
+        if (!webSdPlaybackBusy()) {
           int p = msg.indexOf("trackIndex");
           if (p >= 0) {
             int c = msg.indexOf(":", p);
@@ -4215,6 +4231,7 @@ static void performSystemInit(bool verbose) {
   ws.enableHeartbeat(30000, 5000, 3);
   if (verbose) {
     Serial.println("HTTP + WebSocket server started on port 80.");
+    Serial.println("Smartphone: connect to AP above, then open http://192.168.4.1");
   }
 
   ensureStreamPlaybackTask();
