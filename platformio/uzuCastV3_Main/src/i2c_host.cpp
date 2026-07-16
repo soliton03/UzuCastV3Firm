@@ -140,6 +140,15 @@ void i2cHostBroadcastSetMode(TdmDataMode mode) {
   }
 }
 
+void i2cHostBroadcastClearBuffer(uint8_t bufferType) {
+  for (uint8_t ch = 1; ch <= I2C_SLAVE_COUNT; ch++) {
+    if (!i2cHostClearBuffer(ch, bufferType)) {
+      Serial.printf("[I2C] CLEAR_BUFFER CH%u type=%u failed\n",
+                    (unsigned)ch, (unsigned)bufferType);
+    }
+  }
+}
+
 static void refreshConnectedTable() {
   const uint32_t now = millis();
   if ((uint32_t)(now - g_lastConnectedRefreshMs) < I2C_CONNECTED_REFRESH_MS) {

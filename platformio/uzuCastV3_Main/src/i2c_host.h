@@ -15,4 +15,5 @@ bool i2cHostClearBuffer(uint8_t channelNo, uint8_t bufferType);
 bool i2cHostSetDelay(uint8_t channelNo, int16_t delayMs);
 
 void i2cHostBroadcastSetMode(TdmDataMode mode);
+void i2cHostBroadcastClearBuffer(uint8_t bufferType);
 void i2cHostScanChannels();

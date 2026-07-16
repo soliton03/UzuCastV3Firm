@@ -35,7 +35,7 @@ Events Run On:    Core 1
 #endif
 
 #define VERSION_STRING   "UZU CAST Version 1.00"
-#define FIRMWARE_BUILD   10037
+#define FIRMWARE_BUILD   10045
 #define FIRMWARE_BUILD_STR_HELPER(x) #x
 #define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 
@@ -61,6 +61,7 @@ static bool check_uzu_magic(File& f);
 static bool read_uzu_length_ms(const char* path, uint32_t& lengthMs);
 struct WebTrackInfo;
 static bool read_uzu_track_info(const char* path, WebTrackInfo& info);
+static void stopAllPlayback();
 static void wsSendTrackInfo(uint8_t clientId, int trackIndex0);
 static void wsBroadcastStreamStatus();
 static void wsBroadcastBufferInfo();
@@ -97,7 +98,6 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 static void json_append_escaped(String& s, const char* p);
 static void performSystemInit(bool verbose);
 static void shutdownNetworkServices();
-static void stopAllPlayback();
 
 // ====================================================
 // Power control pins
@@ -515,7 +515,9 @@ static const char kHtml[] PROGMEM = R"HTML(
   let fileStreamActive = false;
   let fileStreamStartPending = false;
   let fileStreamPaused = false;
+  let fileEofDrainPending = false;
   let fileSendPos = 0;
+  let streamBufferSynced = false;
   let pcmSendTimer = null;
   let pcmPumpFn = null;
   let currentTrackIndex = 0;
@@ -635,7 +637,10 @@ static const char kHtml[] PROGMEM = R"HTML(
   }
 
   function maxPumpChunksForChannels(channels){
-    if(testToneFillPct >= 70) return 1;
+    if(testToneFillPct < 20 || testToneUsedBytes < testLowWater) return 16;
+    if(testToneFillPct < 40) return 12;
+    if(testToneFillPct >= 75) return 2;
+    if(testToneFillPct >= 70) return 3;
     if(channels >= 8){
       if(testToneStartPending || fileStreamStartPending) return 6;
       if(testToneUsedBytes < testLowWater) return 4;
@@ -648,7 +653,7 @@ static const char kHtml[] PROGMEM = R"HTML(
     }
     if(testToneStartPending || fileStreamStartPending) return 6;
     if(testToneUsedBytes < testLowWater) return 4;
-    return 2;
+    return 3;
   }
 
   function maxPumpChunks(){
@@ -756,6 +761,7 @@ static const char kHtml[] PROGMEM = R"HTML(
   }
 
   function notifyEspFileHeader(meta){
+    streamBufferSynced = false;
     send({cmd:"set_mode", mode:"STREAM"});
     send({cmd:"file_info", name:meta.name, sampleRate:meta.sampleRate, bitsPerSample:16, channels:meta.channels, durationMs:meta.lengthMs});
     send({cmd:"prepare"});
@@ -865,7 +871,7 @@ static const char kHtml[] PROGMEM = R"HTML(
     if(Date.now() < testToneBackoffUntil) return false;
     if(ws.bufferedAmount > testWsBufferMax()) return false;
     const chunk = testChunkBytes();
-    if(testToneFreeBytes < (chunk + TEST_SEND_MARGIN)) return false;
+    if(testToneFreeBytes < chunk) return false;
     return true;
   }
 
@@ -875,8 +881,6 @@ static const char kHtml[] PROGMEM = R"HTML(
     while(sent < maxCount){
       if(!canSendTestPcm()) break;
       ws.send(buildTestPcmChunk());
-      testToneFreeBytes -= chunk;
-      testToneUsedBytes += chunk;
       testToneChunksSent++;
       sent++;
     }
@@ -899,6 +903,7 @@ static const char kHtml[] PROGMEM = R"HTML(
   }
 
   function onStreamBufferInfo(msg){
+    streamBufferSynced = true;
     if(typeof msg.bufferSize === "number") testToneBufferSize = msg.bufferSize;
     const ch = fileStreamActive && browserFile ? browserFile.channels : testToneChannels;
     updateStreamWatermarks(ch);
@@ -908,6 +913,12 @@ static const char kHtml[] PROGMEM = R"HTML(
     if(typeof msg.underrunCount === "number"){
       if(msg.underrunCount > testToneUnderrunCount){
         testToneBackoffUntil = 0;
+        if(typeof msg.freeBytes === "number"){
+          testToneFreeBytes = msg.freeBytes;
+        }
+        if(typeof msg.usedBytes === "number"){
+          testToneUsedBytes = msg.usedBytes;
+        }
       }
       testToneUnderrunCount = msg.underrunCount;
     }
@@ -924,6 +935,10 @@ static const char kHtml[] PROGMEM = R"HTML(
     updateBufferMonitor();
     maybeStartTestPlayback();
     maybeStartFilePlayback();
+    if(fileEofDrainPending && testToneUsedBytes < fileChunkBytes()){
+      fileEofDrainPending = false;
+      send({cmd:"stop"});
+    }
   }
 
   function restartTestToneSendTimer(){
@@ -1005,7 +1020,7 @@ static const char kHtml[] PROGMEM = R"HTML(
     if(Date.now() < testToneBackoffUntil) return false;
     if(ws.bufferedAmount > wsBufferMaxForChannels(browserFile.channels)) return false;
     const chunk = fileChunkBytes();
-    if(testToneFreeBytes < (chunk + TEST_SEND_MARGIN)) return false;
+    if(testToneFreeBytes < chunk) return false;
     if(fileSendPos >= browserFile.buffer.byteLength) return false;
     return true;
   }
@@ -1018,8 +1033,6 @@ static const char kHtml[] PROGMEM = R"HTML(
       const pcm = buildFilePcmChunk();
       if(!pcm) break;
       ws.send(pcm);
-      testToneFreeBytes -= chunk;
-      testToneUsedBytes += chunk;
       testToneChunksSent++;
       sent++;
     }
@@ -1038,12 +1051,20 @@ static const char kHtml[] PROGMEM = R"HTML(
       updateSeekLabel();
     }
     if(fileSendPos >= browserFile.buffer.byteLength && !fileStreamStartPending){
-      endFilePlaybackAtEof();
+      stopPcmPump();
+      fileStreamActive = false;
+      fileStreamStartPending = false;
+      fileStreamPaused = false;
+      fileEofDrainPending = true;
+      currentPlayState = "STOP";
+      playState.textContent = "State: STOP (END)";
+      updatePlaybackLock();
     }
   }
 
   function maybeStartFilePlayback(){
     if(!fileStreamStartPending) return;
+    if(!streamBufferSynced) return;
     if(testToneUsedBytes < testPrefillTarget) return;
     fileStreamStartPending = false;
     send({cmd:"start"});
@@ -1065,6 +1086,9 @@ static const char kHtml[] PROGMEM = R"HTML(
     testToneLastDroppedBytes = 0;
     testToneBackoffUntil = 0;
     testToneChunksSent = 0;
+    testToneUsedBytes = 0;
+    testToneFreeBytes = testToneBufferSize;
+    streamBufferSynced = false;
     updateStreamWatermarks(browserFile.channels);
     currentPlayState = "PLAY";
     playState.textContent = "State: BUFFERING";
@@ -1077,6 +1101,7 @@ static const char kHtml[] PROGMEM = R"HTML(
     fileStreamActive = false;
     fileStreamStartPending = false;
     fileStreamPaused = false;
+    fileEofDrainPending = false;
     currentPlayState = "STOP";
     playState.textContent = "State: STOP";
     testToneFreeBytes = testToneBufferSize;
@@ -1114,9 +1139,9 @@ static const char kHtml[] PROGMEM = R"HTML(
     fileStreamActive = false;
     fileStreamStartPending = false;
     fileStreamPaused = false;
+    fileEofDrainPending = true;
     currentPlayState = "STOP";
     playState.textContent = "State: STOP (END)";
-    send({cmd:"stop"});
     updatePlaybackLock();
   }
 
@@ -1146,7 +1171,6 @@ static const char kHtml[] PROGMEM = R"HTML(
       seek.value = "0";
       fileSendPos = browserFile.dataStart;
       updateSeekLabel();
-      notifyEspFileHeader(browserFile);
       if(!detailVisible){
         detailVisible = true;
         trackInfo.style.display = "block";
@@ -1252,7 +1276,11 @@ static const char kHtml[] PROGMEM = R"HTML(
         }
 
         if(msg.cmd === "underrun"){
+          testToneBackoffUntil = 0;
           testToneUnderrunCount++;
+          if(fileStreamActive && browserFile && fileSendPos < browserFile.buffer.byteLength){
+            sendFileChunks(24);
+          }
           updateBufferMonitor();
           return;
         }
@@ -2002,6 +2030,33 @@ enum class StreamState {
 
 static DeviceMode g_deviceMode = DeviceMode::SD;
 
+// Browser UZU stream debug (serial log). Paste [STREAM-DBG] lines when reporting issues.
+#ifndef UZU_STREAM_DBG
+#define UZU_STREAM_DBG 1
+#endif
+
+#if UZU_STREAM_DBG
+static uint32_t g_streamDbgBinRx = 0;
+static uint32_t g_streamDbgBinOk = 0;
+static uint32_t g_streamDbgBinRejectMode = 0;
+static uint32_t g_streamDbgBinRejectState = 0;
+static uint32_t g_streamDbgBinRejectLen = 0;
+static uint32_t g_streamDbgLastSummaryMs = 0;
+
+static const char* deviceModeName(DeviceMode mode) {
+  return (mode == DeviceMode::STREAM) ? "STREAM" : "SD";
+}
+
+static void streamDbgResetCounters() {
+  g_streamDbgBinRx = 0;
+  g_streamDbgBinOk = 0;
+  g_streamDbgBinRejectMode = 0;
+  g_streamDbgBinRejectState = 0;
+  g_streamDbgBinRejectLen = 0;
+  g_streamDbgLastSummaryMs = 0;
+}
+#endif
+
 class PcmRingBuffer {
 public:
   static constexpr size_t PSRAM_TARGET_BYTES = 1048576;
@@ -2102,6 +2157,19 @@ static uint32_t streamMinStartBytes() {
   return (uint32_t)(cap / 3);
 }
 
+static const char* streamStateToString(StreamState st) {
+  switch (st) {
+    case StreamState::IDLE:      return "IDLE";
+    case StreamState::PREPARED:  return "PREPARED";
+    case StreamState::BUFFERING: return "BUFFERING";
+    case StreamState::PLAYING:   return "PLAYING";
+    case StreamState::PAUSED:    return "PAUSED";
+    case StreamState::STOPPED:   return "STOPPED";
+    case StreamState::ERROR:     return "ERROR";
+    default:                     return "UNKNOWN";
+  }
+}
+
 class StreamEngine {
 public:
   StreamState state() const { return m_state; }
@@ -2111,9 +2179,9 @@ public:
   uint32_t rxBytes() const { return g_streamRxBytes; }
 
   void reset() {
-    stopInternal(false);
+    stopInternal(true);
     m_state = StreamState::IDLE;
-    m_underrunCount = 0;
+    g_streamRxBytes = 0;
   }
 
   bool prepare(uint32_t sampleRate, uint32_t channels, uint32_t bits) {
@@ -2202,11 +2270,27 @@ public:
   }
 
   size_t pushPcm(const uint8_t* data, size_t len) {
-    if (g_deviceMode != DeviceMode::STREAM) return 0;
+    if (g_deviceMode != DeviceMode::STREAM) {
+#if UZU_STREAM_DBG
+      g_streamDbgBinRejectMode++;
+      if (g_streamDbgBinRejectMode <= 3) {
+        Serial.printf("[STREAM-DBG] pushPcm reject: devMode=%s (need STREAM)\n",
+                      deviceModeName(g_deviceMode));
+      }
+#endif
+      return 0;
+    }
     if (m_state != StreamState::PREPARED &&
         m_state != StreamState::BUFFERING &&
         m_state != StreamState::PLAYING &&
         m_state != StreamState::PAUSED) {
+#if UZU_STREAM_DBG
+      g_streamDbgBinRejectState++;
+      if (g_streamDbgBinRejectState <= 3) {
+        Serial.printf("[STREAM-DBG] pushPcm reject: state=%s\n",
+                      streamStateToString(m_state));
+      }
+#endif
       return 0;
     }
 
@@ -2216,6 +2300,13 @@ public:
 
     const size_t fullChunk = (size_t)FRAMES_PER_WRITE * m_channels * 2;
     if (len != fullChunk) {
+#if UZU_STREAM_DBG
+      g_streamDbgBinRejectLen++;
+      if (g_streamDbgBinRejectLen <= 5) {
+        Serial.printf("[STREAM-DBG] pushPcm reject: len=%u expect=%u (ch=%u)\n",
+                      (unsigned)len, (unsigned)fullChunk, (unsigned)m_channels);
+      }
+#endif
       return 0;
     }
 
@@ -2253,11 +2344,15 @@ public:
       Serial.printf("[STREAM] PLAYING (buf=%u bytes, %uch)\n",
                     (unsigned)g_streamRing.usedBytes(),
                     (unsigned)m_channels);
+#if UZU_STREAM_DBG
+      streamDbgSummary(true);
+#endif
     }
 
     if (m_state != StreamState::PLAYING) return;
 
-    for (uint32_t i = 0; i < 4; i++) {
+    const uint32_t burstMax = 4U;
+    for (uint32_t i = 0; i < burstMax; i++) {
       if (!processOneAudioBlock()) break;
     }
 
@@ -2287,7 +2382,7 @@ private:
     const uint32_t avail = (uint32_t)g_streamRing.usedBytes();
     const uint32_t now = millis();
 
-    if (avail > 0 && avail < wantBytes) {
+    if ((int32_t)(nowUs - (uint32_t)m_streamNextBlockUs) < 0) {
       return false;
     }
 
@@ -2300,30 +2395,47 @@ private:
       g_tdmTxBuf[i] = 0;
     }
 
+    uint32_t framesFilled = 0;
+    bool hadUnderrun = false;
+
     if (avail >= wantBytes) {
       size_t got = g_streamRing.read(g_streamPcmBuf, wantBytes);
       if (got >= wantBytes) {
-        for (uint32_t f = 0; f < FRAMES_PER_WRITE; ++f) {
-          uint32_t srcBase = f * bytesPerFrame;
-          uint32_t dstBase = f * TDM_NUM_CH;
-          for (uint32_t ch = 0; ch < m_channels; ++ch) {
-            int16_t s = le16_to_s16(&g_streamPcmBuf[srcBase + ch * 2]);
-            g_tdmTxBuf[dstBase + ch] = apply_volume_127(s, g_volume);
-          }
-        }
-        if (i2cModeGet() == TdmDataMode::RAW) {
-          tdmApplyRawTagCh8(FRAMES_PER_WRITE);
-        }
-        m_underrunSent = false;
+        framesFilled = FRAMES_PER_WRITE;
       } else {
-        m_underrunCount++;
-        if (!m_underrunSent) {
+        hadUnderrun = true;
+        if (got >= bytesPerFrame) {
+          framesFilled = (uint32_t)(got / bytesPerFrame);
+        }
+        if (!m_underrunSent && got < wantBytes) {
           Serial.printf("[STREAM] underrun (short read got=%u)\n", (unsigned)got);
-          wsRequestUnderrun();
-          m_underrunSent = true;
         }
       }
+    } else if (avail >= bytesPerFrame) {
+      const uint32_t aligned = (avail / bytesPerFrame) * bytesPerFrame;
+      size_t got = g_streamRing.read(g_streamPcmBuf, aligned);
+      framesFilled = (uint32_t)(got / bytesPerFrame);
+      hadUnderrun = true;
     } else {
+      if (avail > 0) {
+        uint8_t trash[1024];
+        g_streamRing.read(trash, avail);
+      }
+      hadUnderrun = true;
+    }
+
+    if (framesFilled > 0) {
+      for (uint32_t f = 0; f < framesFilled; ++f) {
+        uint32_t srcBase = f * bytesPerFrame;
+        uint32_t dstBase = f * TDM_NUM_CH;
+        for (uint32_t ch = 0; ch < m_channels; ++ch) {
+          int16_t s = le16_to_s16(&g_streamPcmBuf[srcBase + ch * 2]);
+          g_tdmTxBuf[dstBase + ch] = apply_volume_127(s, g_volume);
+        }
+      }
+    }
+
+    if (hadUnderrun) {
       m_underrunCount++;
       if (!m_underrunSent) {
         wsRequestUnderrun();
@@ -2332,9 +2444,16 @@ private:
       if ((now - m_lastUnderrunLogMs) >= 1000) {
         m_lastUnderrunLogMs = now;
         Serial.printf("[STREAM] underrun (avail=%u need=%u total=%lu)\n",
-                      (unsigned)avail, (unsigned)wantBytes,
+                      (unsigned)avail,
+                      (unsigned)wantBytes,
                       (unsigned long)m_underrunCount);
       }
+    } else {
+      m_underrunSent = false;
+    }
+
+    if (i2cModeGet() == TdmDataMode::RAW) {
+      tdmApplyRawTagCh8(FRAMES_PER_WRITE);
     }
 
     size_t bytesWritten = 0;
@@ -2384,6 +2503,37 @@ static uint32_t g_lastBinBufferInfoMs = 0;
 static TaskHandle_t g_streamTaskHandle = nullptr;
 static TaskHandle_t g_playerTaskHandle = nullptr;
 
+#if UZU_STREAM_DBG
+static void streamDbgSummary(bool force) {
+  const uint32_t now = millis();
+  if (!force && (uint32_t)(now - g_streamDbgLastSummaryMs) < 5000U) {
+    return;
+  }
+  g_streamDbgLastSummaryMs = now;
+  Serial.printf(
+      "[STREAM-DBG] devMode=%s engine=%s tdmEn=%d i2c=%s "
+      "pending=%luHz/%uch/%ubit ring=%u/%u rxB=%lu drop=%lu underrun=%lu "
+      "bin(rx=%lu ok=%lu rejMode=%lu rejState=%lu rejLen=%lu)\n",
+      deviceModeName(g_deviceMode),
+      streamStateToString(g_streamEngine.state()),
+      (int)g_tdm_enabled,
+      tdmDataModeName(i2cModeGet()),
+      (unsigned long)g_streamPendingSampleRate,
+      (unsigned long)g_streamPendingChannels,
+      (unsigned long)g_streamPendingBits,
+      (unsigned)g_streamRing.usedBytes(),
+      (unsigned)g_streamRing.capacity(),
+      (unsigned long)g_streamEngine.rxBytes(),
+      (unsigned long)g_streamEngine.droppedBytes(),
+      (unsigned long)g_streamEngine.underrunCount(),
+      (unsigned long)g_streamDbgBinRx,
+      (unsigned long)g_streamDbgBinOk,
+      (unsigned long)g_streamDbgBinRejectMode,
+      (unsigned long)g_streamDbgBinRejectState,
+      (unsigned long)g_streamDbgBinRejectLen);
+}
+#endif
+
 static void streamPlaybackTask(void* param) {
   (void)param;
   for (;;) {
@@ -2404,19 +2554,6 @@ static void ensureStreamPlaybackTask() {
       5,
       &g_streamTaskHandle,
       1);
-}
-
-static const char* streamStateToString(StreamState st) {
-  switch (st) {
-    case StreamState::IDLE:      return "IDLE";
-    case StreamState::PREPARED:  return "PREPARED";
-    case StreamState::BUFFERING: return "BUFFERING";
-    case StreamState::PLAYING:   return "PLAYING";
-    case StreamState::PAUSED:    return "PAUSED";
-    case StreamState::STOPPED:   return "STOPPED";
-    case StreamState::ERROR:     return "ERROR";
-    default:                     return "UNKNOWN";
-  }
 }
 
 static int jsonExtractInt(const String& msg, const char* key, int defVal) {
@@ -2845,6 +2982,30 @@ static void stopAllPlayback() {
   g_streamEngine.stop();
 }
 
+static void streamBeginSession() {
+#if UZU_STREAM_DBG
+  Serial.printf("[STREAM-DBG] beginSession (before) devMode=%s i2c=%s engine=%s\n",
+                deviceModeName(g_deviceMode),
+                tdmDataModeName(i2cModeGet()),
+                streamStateToString(g_streamEngine.state()));
+#endif
+  stopAllPlayback();
+  tdm_disable_output();
+  i2cModeSet(TdmDataMode::RAW);
+  i2cModeProcess();
+#if UZU_ENABLE_I2C
+  i2cHostBroadcastSetMode(TdmDataMode::RAW);
+  i2cHostBroadcastClearBuffer(0x00);
+  Serial.println("[STREAM] I2C slaves -> RAW + buffer clear");
+#endif
+#if UZU_STREAM_DBG
+  streamDbgResetCounters();
+  Serial.printf("[STREAM-DBG] beginSession (after) i2c=%s tdmEn=%d\n",
+                tdmDataModeName(i2cModeGet()),
+                (int)g_tdm_enabled);
+#endif
+}
+
 static bool playTrackByIndex(int index) {
   if (index <= 0 || index > g_fileCount) {
     return false;
@@ -3236,7 +3397,7 @@ static void wsBroadcastBufferInfo() {
   st += (unsigned long)g_streamEngine.underrunCount();
   st += ",\"droppedBytes\":";
   st += (unsigned long)g_streamEngine.droppedBytes();
-  const bool sendHold = (freeb < 6144) || (fillPct >= 80);
+  const bool sendHold = (freeb < 4096) || (fillPct >= 88);
   st += ",\"sendHold\":";
   st += sendHold ? "true" : "false";
   st += "}";
@@ -3261,6 +3422,7 @@ static void wsRequestBufferInfo() {
 
 static void wsRequestUnderrun() {
   g_wsNotifyUnderrun = true;
+  g_wsNotifyBufferInfo = true;
 }
 
 static void wsProcessNotifications() {
@@ -3274,8 +3436,10 @@ static void wsProcessNotifications() {
   if (g_wsNotifyUnderrun) {
     g_wsNotifyUnderrun = false;
     wsBroadcastUnderrun();
+    wsBroadcastBufferInfo();
+    s_lastBufferInfoMs = now;
   }
-  if (g_wsNotifyBufferInfo && (now - s_lastBufferInfoMs) >= 50) {
+  if (g_wsNotifyBufferInfo && (now - s_lastBufferInfoMs) >= 30) {
     g_wsNotifyBufferInfo = false;
     s_lastBufferInfoMs = now;
     wsBroadcastBufferInfo();
@@ -3301,10 +3465,23 @@ static bool handleStreamTextCommand(uint8_t num, const String& msg) {
 
   if (msg.indexOf("\"cmd\":\"set_mode\"") >= 0) {
     if (msg.indexOf("\"STREAM\"") >= 0) {
+#if UZU_STREAM_DBG
+      Serial.println("[STREAM-DBG] cmd set_mode STREAM");
+#endif
       g_player.stop();
+      g_uzcPlayer.stop();
+      g_uzcPlaying = false;
+      i2sTestStop();
       g_deviceMode = DeviceMode::STREAM;
       g_streamEngine.reset();
+      wsBroadcastBufferInfo();
+#if UZU_STREAM_DBG
+      streamDbgSummary(true);
+#endif
     } else {
+#if UZU_STREAM_DBG
+      Serial.println("[STREAM-DBG] cmd set_mode SD");
+#endif
       g_streamEngine.stop();
       g_deviceMode = DeviceMode::SD;
     }
@@ -3323,22 +3500,46 @@ static bool handleStreamTextCommand(uint8_t num, const String& msg) {
     if (msg.indexOf("\"bitsPerSample\"") >= 0) {
       g_streamPendingBits = (uint32_t)jsonExtractInt(msg, "bitsPerSample", 16);
     }
+#if UZU_STREAM_DBG
+    Serial.printf("[STREAM-DBG] cmd file_info %luHz %uch %ubit\n",
+                  (unsigned long)g_streamPendingSampleRate,
+                  (unsigned long)g_streamPendingChannels,
+                  (unsigned long)g_streamPendingBits);
+#endif
     ws.sendTXT(num, "{\"type\":\"ack\"}");
     return true;
   }
 
   if (msg.indexOf("\"cmd\":\"prepare\"") >= 0) {
-    g_player.stop();
+#if UZU_STREAM_DBG
+    Serial.printf("[STREAM-DBG] cmd prepare %luHz %uch %ubit i2c=%s\n",
+                  (unsigned long)g_streamPendingSampleRate,
+                  (unsigned long)g_streamPendingChannels,
+                  (unsigned long)g_streamPendingBits,
+                  tdmDataModeName(i2cModeGet()));
+#endif
+    streamBeginSession();
     if (!g_streamEngine.prepare(
             g_streamPendingSampleRate,
             g_streamPendingChannels,
             g_streamPendingBits)) {
+#if UZU_STREAM_DBG
+      Serial.printf("[STREAM-DBG] prepare FAILED -> engine=%s\n",
+                    streamStateToString(g_streamEngine.state()));
+      streamDbgSummary(true);
+#endif
       ws.sendTXT(num, "{\"cmd\":\"error\",\"message\":\"Invalid format\"}");
       wsBroadcastStreamStatus();
       return true;
     }
 
     g_deviceMode = DeviceMode::STREAM;
+#if UZU_STREAM_DBG
+    Serial.printf("[STREAM-DBG] prepare OK engine=%s chunk=%uB\n",
+                  streamStateToString(g_streamEngine.state()),
+                  (unsigned)(FRAMES_PER_WRITE * g_streamPendingChannels * 2));
+    streamDbgSummary(true);
+#endif
     wsBroadcastStreamStatus();
     wsBroadcastBufferInfo();
     ws.sendTXT(num, "{\"type\":\"ack\"}");
@@ -3346,12 +3547,30 @@ static bool handleStreamTextCommand(uint8_t num, const String& msg) {
   }
 
   if (msg.indexOf("\"cmd\":\"start\"") >= 0) {
+#if UZU_STREAM_DBG
+    Serial.printf("[STREAM-DBG] cmd start (before) engine=%s ring=%u/%u\n",
+                  streamStateToString(g_streamEngine.state()),
+                  (unsigned)g_streamRing.usedBytes(),
+                  (unsigned)g_streamRing.capacity());
+#endif
     if (!g_streamEngine.start()) {
+#if UZU_STREAM_DBG
+      Serial.printf("[STREAM-DBG] start FAILED engine=%s\n",
+                    streamStateToString(g_streamEngine.state()));
+      streamDbgSummary(true);
+#endif
       ws.sendTXT(num, "{\"cmd\":\"error\",\"message\":\"Start failed\"}");
       wsBroadcastStreamStatus();
       return true;
     }
+#if UZU_STREAM_DBG
+    Serial.printf("[STREAM-DBG] start OK engine=%s minStart=%lu\n",
+                  streamStateToString(g_streamEngine.state()),
+                  (unsigned long)streamMinStartBytes());
+    streamDbgSummary(true);
+#endif
     wsBroadcastStreamStatus();
+    wsBroadcastBufferInfo();
     ws.sendTXT(num, "{\"type\":\"ack\"}");
     return true;
   }
@@ -3531,10 +3750,26 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     }
 
     case WStype_BIN: {
+#if UZU_STREAM_DBG
+      g_streamDbgBinRx++;
+#endif
       size_t written = g_streamEngine.pushPcm(payload, length);
+#if UZU_STREAM_DBG
+      if (written > 0) {
+        g_streamDbgBinOk++;
+      }
+      if (written == 0 && g_streamDbgBinRx <= 8) {
+        Serial.printf("[STREAM-DBG] BIN #%lu len=%u written=0 devMode=%s engine=%s\n",
+                      (unsigned long)g_streamDbgBinRx,
+                      (unsigned)length,
+                      deviceModeName(g_deviceMode),
+                      streamStateToString(g_streamEngine.state()));
+      }
+      streamDbgSummary(false);
+#endif
       if (written > 0) {
         uint32_t now = millis();
-        const uint32_t infoInterval = 50u;
+        const uint32_t infoInterval = 30u;
         if ((now - g_lastBinBufferInfoMs) >= infoInterval) {
           g_lastBinBufferInfoMs = now;
           wsBroadcastBufferInfo();

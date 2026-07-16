@@ -212,7 +212,7 @@ static void DBG(const char* fmt, ...) {
 
 // 不要なコードを削除: 48kHz->44.1kHz の判別/リサンプルは Main 側で完結
 #ifndef BUILD_NUMBER
-#define BUILD_NUMBER 87
+#define BUILD_NUMBER 96
 #endif
 
 // 1=BT未接続でもI2Sタグ処理を有効化（Master-Slave I2Sベンチテスト用）
@@ -398,6 +398,9 @@ static volatile uint32_t g_a2dp_output_rate = 44100;
 static volatile uint32_t g_a2dp_negotiated_rate = 44100;
 static volatile bool g_media_start_pending = false;
 static volatile uint32_t g_media_start_due_ms = 0;
+static volatile uint32_t g_connect_media_earliest_ms = 0;
+static constexpr uint32_t BT_CONNECT_SETTLE_MS = 250;
+static constexpr uint32_t BT_MEDIA_START_DELAY_MS = 120;
 
 // Arduino-ESP32 packages differ in how esp_a2d_mcc_t is exposed.
 // Some versions expose parsed SBC fields (cie.sbc_info.*), others only raw bytes (cie.sbc[]).
@@ -478,9 +481,10 @@ static volatile BtState g_state = ST_IDLE;
 // ============================================================
 static portMUX_TYPE g_rb_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static constexpr uint32_t PCM_HOLD_FRAMES = 5888;  // ~133ms @44.1kHz (ring buf removed)
-static constexpr uint32_t PCM_PREBUFFER_FRAMES = 2304;  // 2 MP3 frames @44.1kHz
-static constexpr uint32_t PCM_I2S_BACKPRESSURE_FRAMES = 1152;
+static constexpr uint32_t PCM_HOLD_FRAMES = 5888;  // ~133ms @44.1kHz (6400 overflows DRAM)
+static constexpr uint32_t PCM_PREBUFFER_FRAMES = 3584;  // ~81ms before BT media start
+static constexpr uint32_t PCM_PLAYBACK_MIN_HOLD = 3072;  // ~70ms before audio_cb drains
+static constexpr uint32_t PCM_HOLD_PREPLAY_MAX = PCM_PREBUFFER_FRAMES + 256;
 static int16_t g_pcm_hold[PCM_HOLD_FRAMES * 2];
 static uint32_t g_pcm_hold_w = 0;
 static uint32_t g_pcm_hold_r = 0;
@@ -502,6 +506,7 @@ static uint32_t g_i2s_bench_pcm_out = 0;
 #endif
 
 static void startMedia();
+static void scheduleMediaStart();
 static void startConnectOrPairingFromIdle();
 static void uzcClearDecodeNotifications();
 static const char* stateName(BtState s);
@@ -520,49 +525,33 @@ static inline uint32_t pcmHoldMinForLog() {
   return (g_pcm_hold_min == UINT32_MAX) ? 0U : g_pcm_hold_min;
 }
 
-static uint32_t pcmHoldFreeFrames() {
+static void scheduleMediaStart() {
+  if (g_media_ctrl_started || g_media_start_pending || g_state != ST_CONNECT || !g_audio_enable) {
+    return;
+  }
+  g_media_start_pending = true;
+  uint32_t due = millis() + BT_MEDIA_START_DELAY_MS;
+  if (g_connect_media_earliest_ms != 0 && g_connect_media_earliest_ms > due) {
+    due = g_connect_media_earliest_ms;
+  }
+  g_media_start_due_ms = due;
+}
+
+static void beginPcmPlaybackToBt() {
+  if (g_pcm_playback_active) {
+    return;
+  }
+  uint32_t holdUsed = 0;
   portENTER_CRITICAL(&g_rb_mux);
-  const uint32_t holdFree =
-      (g_pcm_hold_used < PCM_HOLD_FRAMES) ? (PCM_HOLD_FRAMES - g_pcm_hold_used) : 0U;
+  holdUsed = g_pcm_hold_used;
   portEXIT_CRITICAL(&g_rb_mux);
-  return holdFree;
-}
-
-static uint32_t pcmPipelineFreeFrames() {
-  return pcmHoldFreeFrames();
-}
-
-static bool pcmPlaybackDraining() {
-#if UZU_I2S_TEST_BYPASS_BT
-  return g_i2s_bench_playback ||
-         (g_pcm_playback_active && g_state == ST_CONNECT && g_audio_enable);
-#else
-  return g_pcm_playback_active && g_state == ST_CONNECT && g_audio_enable;
-#endif
-}
-
-static void waitForPcmPipelineSpace(uint32_t needFrames) {
-  if (!pcmPlaybackDraining()) {
+  if (holdUsed < PCM_PLAYBACK_MIN_HOLD) {
     return;
   }
-  uint32_t spins = 0;
-  while (needFrames > 0) {
-    if (pcmPipelineFreeFrames() >= needFrames) {
-      return;
-    }
-    vTaskDelay(1);
-    if (++spins > 2000U) {
-      return;
-    }
-  }
-}
-
-static void tryStartMediaWhenBuffered() {
-  if (g_media_ctrl_started || g_state != ST_CONNECT) {
-    return;
-  }
-  g_media_ctrl_started = true;
-  startMedia();
+  g_pcm_playback_active = true;
+  g_pcm_underrun_frames = 0;
+  g_pcm_push_drop_frames = 0;
+  g_pcm_hold_min = UINT32_MAX;
 }
 
 static bool pcmReadyForMediaStart() {
@@ -578,7 +567,7 @@ static bool pcmReadyForMediaStart() {
   }
 #if UZU_ENABLE_I2C
   if (g_i2c_slave_output_mode == I2C_MODE_MP3) {
-    return g_tag_stat_decode_ok > 0;
+    return g_tag_stat_decode_ok > 0 || g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
   }
   return g_tag_stat_slots_rx >= PCM_PREBUFFER_FRAMES;
 #else
@@ -712,14 +701,6 @@ static void pollSerialTestCommands() {
 }
 #endif
 
-static void pcmPlaybackBegin() {
-  g_pcm_playback_active = true;
-  g_pcm_underrun_frames = 0;
-  g_pcm_push_drop_frames = 0;
-  g_pcm_hold_min = UINT32_MAX;
-  tryStartMediaWhenBuffered();
-}
-
 static void pcmHoldReset() {
   portENTER_CRITICAL(&g_rb_mux);
   g_pcm_hold_w = 0;
@@ -742,8 +723,15 @@ static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
     return;
   }
 
-  if (pcmPlaybackDraining()) {
-    waitForPcmPipelineSpace(frameCount);
+  const uint32_t holdCap =
+      g_pcm_playback_active ? PCM_HOLD_FRAMES : PCM_HOLD_PREPLAY_MAX;
+  uint32_t holdUsedNow = 0;
+  portENTER_CRITICAL(&g_rb_mux);
+  holdUsedNow = g_pcm_hold_used;
+  portEXIT_CRITICAL(&g_rb_mux);
+  if (holdUsedNow >= holdCap) {
+    g_pcm_push_drop_frames += frameCount;
+    return;
   }
 
   portENTER_CRITICAL(&g_rb_mux);
@@ -781,8 +769,11 @@ static void pcmHoldAppend(const int16_t* stereoFrames, uint32_t frameCount) {
     return;
   }
 #endif
-  if (g_audio_enable && !g_pcm_playback_active && pcmReadyForMediaStart()) {
-    pcmPlaybackBegin();
+  if (g_audio_enable && !g_media_ctrl_started && !g_media_start_pending && pcmReadyForMediaStart()) {
+    scheduleMediaStart();
+  }
+  if (g_audio_enable && g_pcm_playback_active == false && g_audio_state == ESP_A2D_AUDIO_STATE_STARTED) {
+    beginPcmPlaybackToBt();
   }
 }
 
@@ -1942,6 +1933,28 @@ static void i2sTagProcessStereoFrames(const int16_t* stereo, uint32_t stereoFram
 #endif
 }
 
+static int streamI2sBurstLimit(uint32_t holdUsed) {
+  if (!g_pcm_playback_active) {
+    if (holdUsed >= PCM_HOLD_PREPLAY_MAX) {
+      return 2;
+    }
+    if (holdUsed >= PCM_PREBUFFER_FRAMES) {
+      return 8;
+    }
+    return 32;
+  }
+  if (holdUsed >= 5600) {
+    return 4;
+  }
+  if (holdUsed >= 5000) {
+    return 12;
+  }
+  if (holdUsed >= 4200) {
+    return 32;
+  }
+  return 64;
+}
+
 static void serviceI2SInput() {
   static bool rateInit = false;
   if (!rateInit) {
@@ -1955,11 +1968,13 @@ static void serviceI2SInput() {
     return;
   }
 
-  for (int burst = 0; burst < 128; burst++) {
-    if (pcmHoldFreeFrames() < PCM_I2S_BACKPRESSURE_FRAMES) {
-      break;
-    }
+  uint32_t holdUsed = 0;
+  portENTER_CRITICAL(&g_rb_mux);
+  holdUsed = g_pcm_hold_used;
+  portEXIT_CRITICAL(&g_rb_mux);
 
+  const int burstLimit = streamI2sBurstLimit(holdUsed);
+  for (int burst = 0; burst < burstLimit; burst++) {
     static int16_t tmp[128 * 2];
     size_t rbytes = 0;
     esp_err_t e = i2s_read(I2S_NUM_1, tmp, sizeof(tmp), &rbytes, 0);
@@ -2925,6 +2940,9 @@ static void startGapDiscovery() {
 }
 
 static void gapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+  if (param == nullptr) {
+    return;
+  }
   switch (event) {
     case ESP_BT_GAP_DISC_RES_EVT: {
       g_gap_raw_events++;
@@ -3027,8 +3045,9 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
     setPairingSubState(PSS_SCAN);
     setDiscoverableConnectable(false);
     setState(ST_CONNECT);
+    g_connect_media_earliest_ms = millis() + BT_CONNECT_SETTLE_MS;
 
-    // MEDIA START は PCM プリバッファ完了時 (pcmPlaybackBegin) に行う
+    // MEDIA START は loop から遅延実行（I2S/BT コールバック内で esp_a2d_media_ctrl しない）
     g_media_start_pending = false;
     return;
   }
@@ -3036,6 +3055,7 @@ static void connection_state_callback(esp_a2d_connection_state_t state, void *pt
   if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     g_audio_enable = false;
     g_media_start_pending = false;
+    g_connect_media_earliest_ms = 0;
     g_connected_peer_valid = false;
 
     if (g_state == ST_CONNECT) {
@@ -3082,9 +3102,7 @@ static void audio_state_callback(esp_a2d_audio_state_t state, void *ptr) {
   g_audio_state = state;
   DBG("A2DP audio_state=%d", (int)state);
   if (state == ESP_A2D_AUDIO_STATE_STARTED && g_state == ST_CONNECT && g_audio_enable) {
-    if (!g_pcm_playback_active && pcmReadyForMediaStart()) {
-      pcmPlaybackBegin();
-    }
+    beginPcmPlaybackToBt();
   }
 }
 
@@ -3294,7 +3312,10 @@ void loop() {
 
   if (g_media_start_pending && g_state == ST_CONNECT && millis() >= g_media_start_due_ms) {
     g_media_start_pending = false;
-    startMedia();
+    if (!g_media_ctrl_started) {
+      g_media_ctrl_started = true;
+      startMedia();
+    }
   }
 
   if (g_state == ST_RECONNECT_WAIT) {
