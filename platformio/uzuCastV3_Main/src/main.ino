@@ -14,7 +14,9 @@ Arduino Runs On:  Core 1
 Events Run On:    Core 1
 */
 #include <Arduino.h>
+#include <math.h>
 #include "SD_MMC.h"
+#include "uzc_mp3_slot.h"
 
 #include <WiFi.h>
 #include <DNSServer.h>
@@ -35,7 +37,7 @@ Events Run On:    Core 1
 #endif
 
 #define VERSION_STRING   "UZU CAST Version 1.00"
-#define FIRMWARE_BUILD   10045
+#define FIRMWARE_BUILD   10046
 #define FIRMWARE_BUILD_STR_HELPER(x) #x
 #define FIRMWARE_BUILD_STR(x) FIRMWARE_BUILD_STR_HELPER(x)
 
@@ -62,6 +64,10 @@ static bool read_uzu_length_ms(const char* path, uint32_t& lengthMs);
 struct WebTrackInfo;
 static bool read_uzu_track_info(const char* path, WebTrackInfo& info);
 static void stopAllPlayback();
+static void sintestStop();
+static bool sintestSetTestMode(const char* modeArg);
+static bool sintestHandleCommand(const char* arg);
+static const char* sintestModeName();
 static void wsSendTrackInfo(uint8_t clientId, int trackIndex0);
 static void wsBroadcastStreamStatus();
 static void wsBroadcastBufferInfo();
@@ -2564,6 +2570,157 @@ static int jsonExtractInt(const String& msg, const char* key, int defVal) {
 }
 
 // ====================================================
+// Slave test tone (SINTEST): RAW 440Hz sine or MP3 441Hz slot
+// ====================================================
+enum class SinTestOutputMode : uint8_t {
+  RAW = 0,
+  MP3 = 1,
+};
+
+static constexpr uint32_t SINTEST_CH_MIN = 1;
+static constexpr uint32_t SINTEST_CH_MAX = 5;
+static constexpr uint32_t SINTEST_CH2_INDEX = 1;
+static constexpr uint32_t SINTEST_CH8_INDEX = 7;
+static constexpr float SINTEST_RAW_FREQ_HZ = 440.0f;
+static constexpr int16_t SINTEST_TONE_LEVEL = 12000;
+static constexpr uint32_t SINTEST_SINE_LUT_SIZE = 512;
+static constexpr uint32_t SINTEST_PHASE_FRAC_BITS = 8;
+static constexpr uint32_t SINTEST_PHASE_INC =
+    (uint32_t)(((uint64_t)SINTEST_SINE_LUT_SIZE << SINTEST_PHASE_FRAC_BITS) *
+               (uint64_t)SINTEST_RAW_FREQ_HZ / TDM_DEFAULT_SAMPLE_RATE);
+
+static const int16_t I2S_TAG_MP3_START_TDM = (int16_t)0xAA00;
+static const int16_t I2S_TAG_SLOT_DATA_TDM = (int16_t)0xAA55;
+static const int16_t I2S_TAG_MP3_END_TDM   = (int16_t)0x5500;
+static const int16_t I2S_TAG_INVALID_TDM   = (int16_t)0x0000;
+
+static bool g_sintestActive = false;
+static SinTestOutputMode g_sintestMode = SinTestOutputMode::RAW;
+static bool g_sintestCh[SINTEST_CH_MAX] = {};
+static bool g_sintestLutReady = false;
+static int16_t g_sintestSineLut[SINTEST_SINE_LUT_SIZE];
+static uint32_t g_sintestPhaseAcc = 0;
+static uint32_t g_sintestMp3PeriodPos = 0;
+
+static const char* sintestModeName() {
+  return (g_sintestMode == SinTestOutputMode::RAW) ? "RAW" : "MP3";
+}
+
+static void sintestInitSineLut() {
+  if (g_sintestLutReady) {
+    return;
+  }
+  for (uint32_t i = 0; i < SINTEST_SINE_LUT_SIZE; i++) {
+    const float rad = (2.0f * PI * (float)i) / (float)SINTEST_SINE_LUT_SIZE;
+    g_sintestSineLut[i] = (int16_t)(sinf(rad) * (float)SINTEST_TONE_LEVEL);
+  }
+  g_sintestLutReady = true;
+}
+
+static int16_t sintestNextToneSample() {
+  const uint32_t idx =
+      (g_sintestPhaseAcc >> SINTEST_PHASE_FRAC_BITS) & (SINTEST_SINE_LUT_SIZE - 1);
+  g_sintestPhaseAcc += SINTEST_PHASE_INC;
+  return g_sintestSineLut[idx];
+}
+
+static bool sintestAnyChannel() {
+  for (uint32_t i = 0; i < SINTEST_CH_MAX; i++) {
+    if (g_sintestCh[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void sintestApplyTransport() {
+  const TdmDataMode i2cMode =
+      (g_sintestMode == SinTestOutputMode::MP3) ? TdmDataMode::MP3 : TdmDataMode::RAW;
+  i2cModeSet(i2cMode);
+  i2cModeProcess();
+#if UZU_ENABLE_I2C
+  i2cHostBroadcastSetMode(i2cMode);
+#endif
+}
+
+static void sintestStop() {
+  if (!g_sintestActive && !sintestAnyChannel()) {
+    return;
+  }
+  g_sintestActive = false;
+  for (uint32_t i = 0; i < SINTEST_CH_MAX; i++) {
+    g_sintestCh[i] = false;
+  }
+  g_sintestPhaseAcc = 0;
+  g_sintestMp3PeriodPos = 0;
+  tdm_disable_output();
+  Serial.println("[SINTEST] stopped");
+}
+
+static void sintestFillMp3TdmFrame(uint32_t periodPos, int16_t* frame) {
+  for (uint32_t ch = 0; ch < TDM_NUM_CH; ch++) {
+    frame[ch] = 0;
+  }
+  if (periodPos == 0) {
+    frame[SINTEST_CH8_INDEX] = I2S_TAG_MP3_START_TDM;
+  } else if (periodPos >= 1 && periodPos <= UZC_MP3_SLOT_WORDS) {
+    frame[0] = kUzcMp3SlotWords[periodPos - 1];
+    frame[SINTEST_CH8_INDEX] = I2S_TAG_SLOT_DATA_TDM;
+  } else if (periodPos == (UZC_MP3_SLOT_WORDS + 1)) {
+    frame[SINTEST_CH8_INDEX] = I2S_TAG_MP3_END_TDM;
+  } else {
+    frame[SINTEST_CH8_INDEX] = I2S_TAG_INVALID_TDM;
+  }
+}
+
+static void sintestProcess() {
+  if (!g_sintestActive || !sintestAnyChannel()) {
+    return;
+  }
+  if (!g_tx_handle) {
+    sintestStop();
+    return;
+  }
+
+  for (uint32_t f = 0; f < FRAMES_PER_WRITE; ++f) {
+    const uint32_t dstBase = f * TDM_NUM_CH;
+    if (g_sintestMode == SinTestOutputMode::MP3) {
+      sintestFillMp3TdmFrame(g_sintestMp3PeriodPos, &g_tdmTxBuf[dstBase]);
+      g_sintestMp3PeriodPos++;
+      if (g_sintestMp3PeriodPos >= UZC_MP3_PERIOD_STEREO) {
+        g_sintestMp3PeriodPos = 0;
+      }
+    } else {
+      const int16_t tone = sintestNextToneSample();
+      for (uint32_t ch = 0; ch < TDM_NUM_CH; ch++) {
+        g_tdmTxBuf[dstBase + ch] = 0;
+      }
+      for (uint32_t ch = 0; ch < SINTEST_CH_MAX; ch++) {
+        if (g_sintestCh[ch]) {
+          g_tdmTxBuf[dstBase + ch] = tone;
+        }
+      }
+      if (g_sintestCh[0]) {
+        g_tdmTxBuf[dstBase + SINTEST_CH2_INDEX] = I2S_TAG_RAW_TDM;
+        g_tdmTxBuf[dstBase + SINTEST_CH8_INDEX] = I2S_TAG_RAW_TDM;
+      }
+    }
+  }
+
+  size_t bytesWritten = 0;
+  const esp_err_t err = i2s_channel_write(
+      g_tx_handle,
+      g_tdmTxBuf,
+      FRAMES_PER_WRITE * BYTES_PER_TDM_FRAME,
+      &bytesWritten,
+      portMAX_DELAY);
+  if (err != ESP_OK) {
+    Serial.printf("[SINTEST] write error: %d\n", (int)err);
+    sintestStop();
+  }
+}
+
+// ====================================================
 // Player
 // ====================================================
 class UzuTdmPlayer {
@@ -2947,10 +3104,111 @@ static UzuTdmPlayer g_player;
 static UzcTdmPlayer g_uzcPlayer;
 static bool g_uzcPlaying = false;
 
+static bool sintestStartOutput() {
+  if (!sintestAnyChannel()) {
+    sintestStop();
+    return false;
+  }
+
+  g_streamEngine.stop();
+  g_deviceMode = DeviceMode::SD;
+  i2sTestStop();
+  g_uzcPlayer.stop();
+  g_uzcPlaying = false;
+  g_player.stop();
+
+  sintestInitSineLut();
+  sintestApplyTransport();
+  if (g_sintestMode == SinTestOutputMode::MP3) {
+    g_sintestMp3PeriodPos = 0;
+  }
+
+  if (!tdm_set_sample_rate(TDM_DEFAULT_SAMPLE_RATE)) {
+    Serial.println("[SINTEST] ERR TDM rate");
+    return false;
+  }
+  if (!tdm_enable_output()) {
+    Serial.println("[SINTEST] ERR TDM enable");
+    return false;
+  }
+
+  g_sintestActive = true;
+  Serial.printf("[SINTEST] started mode=%s ch=", sintestModeName());
+  for (uint32_t ch = SINTEST_CH_MIN; ch <= SINTEST_CH_MAX; ch++) {
+    if (g_sintestCh[ch - 1]) {
+      Serial.printf("%u", (unsigned)ch);
+    } else {
+      Serial.print('-');
+    }
+    if (ch < SINTEST_CH_MAX) {
+      Serial.print(',');
+    }
+  }
+  Serial.println();
+  return true;
+}
+
+static bool sintestSetTestMode(const char* modeArg) {
+  if (strcmp(modeArg, "RAW") == 0) {
+    g_sintestMode = SinTestOutputMode::RAW;
+  } else if (strcmp(modeArg, "MP3") == 0) {
+    g_sintestMode = SinTestOutputMode::MP3;
+    g_sintestMp3PeriodPos = 0;
+  } else {
+    return false;
+  }
+
+  if (g_sintestActive && sintestAnyChannel()) {
+    sintestApplyTransport();
+    if (g_sintestMode == SinTestOutputMode::MP3) {
+      g_sintestMp3PeriodPos = 0;
+    }
+  }
+
+  Serial.printf("[SINTEST] testmode %s\n", sintestModeName());
+  return true;
+}
+
+static bool sintestEnableChannel(uint32_t ch1based) {
+  if (ch1based < SINTEST_CH_MIN || ch1based > SINTEST_CH_MAX) {
+    return false;
+  }
+  g_sintestCh[ch1based - 1] = true;
+  if (!sintestStartOutput()) {
+    g_sintestCh[ch1based - 1] = false;
+    return false;
+  }
+  return true;
+}
+
+static bool sintestEnableAll() {
+  for (uint32_t i = 0; i < SINTEST_CH_MAX; i++) {
+    g_sintestCh[i] = true;
+  }
+  return sintestStartOutput();
+}
+
+static bool sintestHandleCommand(const char* arg) {
+  if (strcmp(arg, "OFF") == 0) {
+    sintestStop();
+    return true;
+  }
+  if (strcmp(arg, "ALL") == 0) {
+    return sintestEnableAll();
+  }
+
+  char* end = nullptr;
+  const long ch = strtol(arg, &end, 10);
+  if (end == arg || *end != '\0' || ch < (long)SINTEST_CH_MIN || ch > (long)SINTEST_CH_MAX) {
+    return false;
+  }
+  return sintestEnableChannel((uint32_t)ch);
+}
+
 static void playerPlaybackTask(void* param) {
   (void)param;
   for (;;) {
-    if (g_deviceMode != DeviceMode::STREAM && !g_uzcPlaying && !g_i2sTestActive) {
+    if (g_deviceMode != DeviceMode::STREAM && !g_uzcPlaying && !g_i2sTestActive && !g_sintestActive) {
       if (g_player.state() == PlayerState::PLAY) {
         g_player.process();
       } else {
@@ -2976,6 +3234,7 @@ static void ensurePlayerPlaybackTask() {
 
 static void stopAllPlayback() {
   i2sTestStop();
+  sintestStop();
   g_uzcPlayer.stop();
   g_uzcPlaying = false;
   g_player.stop();
@@ -3981,6 +4240,28 @@ private:
     }
 #endif
 
+    if (strcmp(argv[0], "TESTMODE") == 0) {
+      if (argc != 2) { println("ERR BAD_PARAM"); return; }
+      if (sintestSetTestMode(argv[1])) {
+        println("OK TESTMODE");
+        m_serial->print("  MODE ");
+        m_serial->println(sintestModeName());
+      } else {
+        println("ERR BAD_PARAM");
+      }
+      return;
+    }
+
+    if (strcmp(argv[0], "SINTEST") == 0) {
+      if (argc != 2) { println("ERR BAD_PARAM"); return; }
+      if (sintestHandleCommand(argv[1])) {
+        println("OK SINTEST");
+      } else {
+        println("ERR BAD_PARAM");
+      }
+      return;
+    }
+
     if (strcmp(argv[0], "I2STEST") == 0) {
       if (argc == 2 && strcmp(argv[1], "DUMP") == 0) {
         i2sTestDumpTdmReference();
@@ -4036,7 +4317,9 @@ private:
     println("  MOUNT         : mount SD card");
     println("  FREQ <hz>     : set SD clock");
     println("  DIR [path]    : list *.UZU / *.uzc files");
-    println("  MODE RAW|MP3  : TDM output mode");
+    println("  MODE RAW|MP3  : TDM output mode (playback)");
+    println("  TESTMODE RAW|MP3 : Slave test mode (RAW 440Hz / MP3 441Hz slot)");
+    println("  SINTEST <n>|ALL|OFF : Slave test tone on CH1-5");
 #if UZU_ENABLE_I2C
     println("  I2CSCAN       : ping Sub CH1-CH5 on I2C bus");
 #endif
@@ -4528,6 +4811,7 @@ void loop() {
   i2cHostProcess();
 #endif
   i2sTestProcess();
+  sintestProcess();
 
   processSdCardDetect();
 
